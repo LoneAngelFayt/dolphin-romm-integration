@@ -24,10 +24,13 @@ SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))   # default slot for save-and
 SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
 ENV = {
-    "DISPLAY":            ":0",          # Xwayland socket inside the Wayland compositor
-    "WAYLAND_DISPLAY":    "wayland-0",   # labwc Wayland socket; Qt tries this first, falls back to xcb on :0
+    "DISPLAY":            os.environ.get("DISPLAY", ":0"),
+    "WAYLAND_DISPLAY":    os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
+    # DRI_NODE is needed for hardware acceleration in some environments.
+    "DRI_NODE":           os.environ.get("DRI_NODE", ""),
+    "DRINODE":            os.environ.get("DRINODE", ""),
     # Both libraries are required: the interposer redirects open() on
     # /dev/input/* to selkies Unix sockets; the fake libudev makes SDL's
     # udev-based device enumeration report the virtual Xbox 360 pad so SDL
@@ -80,7 +83,7 @@ def _patch_ini():
 
     if not INI_PATH.exists():
         INI_PATH.write_text(
-            "[Display]\nFullscreen = True\n\n[Interface]\nConfirmStop = False\n"
+            "[Display]\nFullscreen = True\n\n[Interface]\nConfirmStop = False\n\n[Core]\nGFXBackend = OGL\n"
         )
         log.info("Created Dolphin.ini with broker defaults")
         return
@@ -88,6 +91,7 @@ def _patch_ini():
     target = {
         "Display":   {"Fullscreen": "True"},
         "Interface": {"ConfirmStop": "False"},
+        "Core":      {"GFXBackend": "OGL"},
     }
 
     try:
