@@ -37,7 +37,10 @@ fi
 # Patch the selkies input_handler.py keep-alive loop to check reader.at_eof().
 # Without this, idle gamepad sockets never detect client disconnection because
 # asyncio buffers the EOF but writer.is_closing() never flips on Unix sockets.
-INPUT_HANDLER="/lsiopy/lib/python3.12/site-packages/selkies/input_handler.py"
+# Locate selkies input_handler.py — glob over the python version so the patch
+# survives base image upgrades that bump e.g. python3.12 → python3.13.
+INPUT_HANDLER=$(compgen -G "/lsiopy/lib/python3.*/site-packages/selkies/input_handler.py" | head -1)
+INPUT_HANDLER="${INPUT_HANDLER:-/lsiopy/lib/python3.12/site-packages/selkies/input_handler.py}"
 if [ -f "$INPUT_HANDLER" ]; then
     if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
         echo "[broker-mod] selkies input_handler.py EOF patch already applied."
@@ -50,15 +53,26 @@ if [ -f "$INPUT_HANDLER" ]; then
     fi
 
     # Silence the selkies_gamepad logger — it emits ~80 INFO lines per launch cycle.
+    # Uses python3 for the insertion because sed \n behaviour is not portable across
+    # GNU/BSD sed variants and can silently produce a literal '\n' in the file.
     if grep -q "setLevel(logging.WARNING)" "$INPUT_HANDLER"; then
         echo "[broker-mod] selkies_gamepad log-level patch already applied."
     else
-        if sed -i \
-            's/logger_selkies_gamepad = logging.getLogger("selkies_gamepad")/logger_selkies_gamepad = logging.getLogger("selkies_gamepad")\nlogger_selkies_gamepad.setLevel(logging.WARNING)/' \
-            "$INPUT_HANDLER"; then
+        if python3 - "$INPUT_HANDLER" <<'PYEOF'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+old = 'logger_selkies_gamepad = logging.getLogger("selkies_gamepad")'
+new = old + '\nlogger_selkies_gamepad.setLevel(logging.WARNING)'
+text = p.read_text()
+if old in text:
+    p.write_text(text.replace(old, new, 1))
+    sys.exit(0)
+sys.exit(1)
+PYEOF
+        then
             echo "[broker-mod] Patched selkies_gamepad log level to WARNING."
         else
-            echo "[broker-mod] ERROR: sed patch failed setting selkies_gamepad log level"
+            echo "[broker-mod] ERROR: python patch failed setting selkies_gamepad log level"
         fi
     fi
 else

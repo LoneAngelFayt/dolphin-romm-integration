@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """broker.py — launch Dolphin on demand and expose a small HTTP API."""
 
+import glob
 import hmac
 import json
 import logging
 import os
 import signal
+import socket as _socket
 import subprocess
 import sys
 import time
@@ -29,6 +31,7 @@ ENV = {
     "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
     "HOME":               "/config",
     "USER":               "abc",
+    "QT_QPA_PLATFORM":    "xcb",  # prevent Qt from attempting Wayland when both DISPLAY and WAYLAND_DISPLAY are set
 }
 
 INI_PATH = Path("/config/.config/dolphin-emu/Config/Dolphin.ini")
@@ -155,7 +158,9 @@ def _launch_dolphin_internal(rom_path):
         "dolphin-emu",
     ]
     if rom_path:
-        cmd.extend(["--exec", rom_path])
+        # '--' terminates option parsing so a path starting with '-' isn't
+        # treated as a dolphin-emu flag.
+        cmd.extend(["--exec", "--", rom_path])
 
     log.info("Launching Dolphin (rom=%s)", rom_path or "dashboard")
     log.debug("Launching: %s", " ".join(cmd))
@@ -206,8 +211,45 @@ def _monitor_process(proc, start_time):
     _launch_dolphin_internal(None)
 
 
+def _drain_gamepad_sockets():
+    """Send EOF to each selkies gamepad socket before launching a new session.
+
+    Connects and immediately sends SHUT_WR so readexactly(1) in the selkies
+    input_handler raises IncompleteReadError — the handler exits cleanly.
+    Socket files that refuse connection are stale and are unlinked.
+    """
+    paths = sorted(
+        glob.glob("/tmp/selkies_js*.sock") + glob.glob("/tmp/selkies_event*.sock")
+    )
+    if not paths:
+        log.debug("Socket drain: no gamepad sockets found.")
+        return
+
+    drained = 0
+    removed = 0
+    for path in paths:
+        try:
+            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+                s.settimeout(0.3)
+                s.connect(path)
+                s.shutdown(_socket.SHUT_WR)
+            drained += 1
+        except OSError:
+            try:
+                os.unlink(path)
+                removed += 1
+            except OSError:
+                pass
+
+    log.debug(
+        "Socket drain: sent EOF to %d socket(s), removed %d dead file(s) (of %d total).",
+        drained, removed, len(paths),
+    )
+
+
 def _launch_dolphin(rom_path):
     _kill_dolphin()
+    _drain_gamepad_sockets()
     _patch_ini()
     time.sleep(2)
     with _session_lock:
@@ -597,6 +639,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
 def main():
     log.info("Broker starting — waiting 5s for desktop...")
+    if not SECRET:
+        log.warning("BROKER_SECRET is not set — all POST/DELETE endpoints are unauthenticated")
     time.sleep(5)
 
     # Kill any stale Dolphin instance left from a previous broker run.
