@@ -25,7 +25,7 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - DOCKER_MODS=ghcr.io/loneangelfa yt/dolphin-romm-integration-mod:latest
+      - DOCKER_MODS=ghcr.io/loneangelfayt/dolphin-romm-integration-mod:latest
       - ROM_ROOT=/romm/library
       - BROKER_PORT=8000          # optional, default 8000
       - BROKER_SECRET=            # optional shared secret
