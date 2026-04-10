@@ -157,9 +157,11 @@ def _launch_dolphin_internal(rom_path):
         "/usr/games/dolphin-emu",
     ]
     if rom_path:
-        # '--' terminates option parsing so a path starting with '-' isn't
-        # treated as a dolphin-emu flag.
-        cmd.extend(["--exec", "--", rom_path])
+        # Use --exec=path (assignment form) so the path is captured as the
+        # flag's value. Dolphin does not support '--' as a POSIX end-of-options
+        # marker and would treat it as a literal filename.
+        # --batch suppresses the GUI and keeps Dolphin in the foreground.
+        cmd.extend([f"--exec={rom_path}", "--batch"])
 
     log.info("Launching Dolphin (rom=%s)", rom_path or "dashboard")
     log.debug("Launching: %s", " ".join(cmd))
