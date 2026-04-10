@@ -24,14 +24,13 @@ SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))   # default slot for save-and
 SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
 ENV = {
-    "DISPLAY":            ":0",
-    "WAYLAND_DISPLAY":    "wayland-1",
+    "DISPLAY":            ":0",          # Xwayland socket inside the Wayland compositor
+    "WAYLAND_DISPLAY":    "wayland-0",   # labwc Wayland socket; Qt tries this first, falls back to xcb on :0
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
     "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
     "HOME":               "/config",
     "USER":               "abc",
-    "QT_QPA_PLATFORM":    "xcb",  # prevent Qt from attempting Wayland when both DISPLAY and WAYLAND_DISPLAY are set
 }
 
 INI_PATH = Path("/config/.config/dolphin-emu/Config/Dolphin.ini")
@@ -155,7 +154,7 @@ def _launch_dolphin_internal(rom_path):
     cmd = [
         "sudo", "-u", "abc", "env",
         *[f"{k}={v}" for k, v in ENV.items()],
-        "dolphin-emu",
+        "/usr/games/dolphin-emu",
     ]
     if rom_path:
         # '--' terminates option parsing so a path starting with '-' isn't
@@ -644,7 +643,7 @@ def main():
     time.sleep(5)
 
     # Kill any stale Dolphin instance left from a previous broker run.
-    result = subprocess.run(["pkill", "-9", "-f", "dolphin-emu"], capture_output=True)
+    result = subprocess.run(["pkill", "-9", "-f", "/usr/games/dolphin-emu"], capture_output=True)
     if result.returncode == 0:
         log.info("Killed stale dolphin-emu instance(s) on startup.")
         time.sleep(2)
