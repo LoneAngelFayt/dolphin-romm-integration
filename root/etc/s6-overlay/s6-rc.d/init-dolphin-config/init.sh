@@ -28,9 +28,6 @@ mkdir -p "$DOLPHIN_CFG_DIR"
 DOLPHIN_INI="$DOLPHIN_CFG_DIR/Dolphin.ini"
 if [ ! -f "$DOLPHIN_INI" ]; then
     cat > "$DOLPHIN_INI" <<'EOF'
-[Display]
-Fullscreen = True
-
 [Interface]
 ConfirmStop = False
 EOF

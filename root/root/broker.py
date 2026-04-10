@@ -657,7 +657,6 @@ def main():
         time.sleep(2)
 
     _patch_ini()
-    _launch_dolphin_internal(None)
 
     server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("ROM broker listening on port %d", PORT)
