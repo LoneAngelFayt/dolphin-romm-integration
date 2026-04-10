@@ -1,0 +1,66 @@
+#!/usr/bin/with-contenv bash
+
+# Ensure python3 is available for the broker service.
+if ! command -v python3 &>/dev/null; then
+    echo "[broker-mod] Installing python3..."
+    apt-get update -qq && apt-get install -y -qq python3 \
+        || echo "[broker-mod] ERROR: failed to install python3"
+fi
+
+# Lock down the sudoers rule so sudo accepts it (requires mode 0440).
+chmod 0440 /etc/sudoers.d/broker
+echo "[broker-mod] sudoers rule set."
+
+# Disable the labwc autostart so dolphin-emu isn't launched a second time by
+# the desktop session — the broker manages the process lifecycle directly.
+AUTOSTART="/config/.config/labwc/autostart"
+mkdir -p "$(dirname "$AUTOSTART")"
+printf '# Disabled by dolphin-broker-mod\n' > "$AUTOSTART"
+echo "[broker-mod] Disabled labwc autostart."
+
+# Create Dolphin config directory and pre-seed Dolphin.ini if absent so the
+# broker's INI patch has something to work with on the very first launch.
+DOLPHIN_CFG_DIR="/config/.config/dolphin-emu/Config"
+mkdir -p "$DOLPHIN_CFG_DIR"
+DOLPHIN_INI="$DOLPHIN_CFG_DIR/Dolphin.ini"
+if [ ! -f "$DOLPHIN_INI" ]; then
+    cat > "$DOLPHIN_INI" <<'EOF'
+[Display]
+Fullscreen = True
+
+[Interface]
+ConfirmStop = False
+EOF
+    echo "[broker-mod] Created default Dolphin.ini."
+fi
+
+# Patch the selkies input_handler.py keep-alive loop to check reader.at_eof().
+# Without this, idle gamepad sockets never detect client disconnection because
+# asyncio buffers the EOF but writer.is_closing() never flips on Unix sockets.
+INPUT_HANDLER="/lsiopy/lib/python3.12/site-packages/selkies/input_handler.py"
+if [ -f "$INPUT_HANDLER" ]; then
+    if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
+        echo "[broker-mod] selkies input_handler.py EOF patch already applied."
+    else
+        sed -i \
+            's/while self\.running and not writer\.is_closing():/while self.running and not writer.is_closing() and not reader.at_eof():/' \
+            "$INPUT_HANDLER" \
+            || echo "[broker-mod] ERROR: sed patch failed on input_handler.py"
+        echo "[broker-mod] Patched selkies input_handler.py EOF detection."
+    fi
+
+    # Silence the selkies_gamepad logger — it emits ~80 INFO lines per launch cycle.
+    if grep -q "setLevel(logging.WARNING)" "$INPUT_HANDLER"; then
+        echo "[broker-mod] selkies_gamepad log-level patch already applied."
+    else
+        if sed -i \
+            's/logger_selkies_gamepad = logging.getLogger("selkies_gamepad")/logger_selkies_gamepad = logging.getLogger("selkies_gamepad")\nlogger_selkies_gamepad.setLevel(logging.WARNING)/' \
+            "$INPUT_HANDLER"; then
+            echo "[broker-mod] Patched selkies_gamepad log level to WARNING."
+        else
+            echo "[broker-mod] ERROR: sed patch failed setting selkies_gamepad log level"
+        fi
+    fi
+else
+    echo "[broker-mod] WARNING: selkies input_handler.py not found at $INPUT_HANDLER"
+fi
