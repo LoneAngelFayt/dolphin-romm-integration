@@ -18,10 +18,13 @@ mkdir -p "$(dirname "$AUTOSTART")"
 printf '# Disabled by dolphin-broker-mod\n' > "$AUTOSTART"
 echo "[broker-mod] Disabled labwc autostart."
 
-# Create Dolphin config directory and pre-seed Dolphin.ini if absent so the
-# broker's INI patch has something to work with on the very first launch.
-DOLPHIN_CFG_DIR="/config/.config/dolphin-emu/Config"
+# Dolphin on this image stores all config files directly in
+# ~/.config/dolphin-emu/ — there is no Config/ subdirectory.
+DOLPHIN_CFG_DIR="/config/.config/dolphin-emu"
 mkdir -p "$DOLPHIN_CFG_DIR"
+
+# Pre-seed Dolphin.ini so the broker's INI patch has something to work with
+# on the very first launch, before Dolphin has written its own copy.
 DOLPHIN_INI="$DOLPHIN_CFG_DIR/Dolphin.ini"
 if [ ! -f "$DOLPHIN_INI" ]; then
     cat > "$DOLPHIN_INI" <<'EOF'
@@ -32,6 +35,16 @@ Fullscreen = True
 ConfirmStop = False
 EOF
     echo "[broker-mod] Created default Dolphin.ini."
+fi
+
+# Copy default controller profile if not already present.  The container ships
+# a ready-made GCPadNew.ini in /defaults/ that maps all 4 GCPad ports to
+# SDL "Microsoft X-Box 360 pad" — exactly what the selkies joystick interposer
+# presents.  Without this file Dolphin has no controller mappings configured.
+GCPAD_INI="$DOLPHIN_CFG_DIR/GCPadNew.ini"
+if [ ! -f "$GCPAD_INI" ] && [ -f "/defaults/GCPadNew.ini" ]; then
+    cp /defaults/GCPadNew.ini "$GCPAD_INI"
+    echo "[broker-mod] Copied default GCPadNew.ini (controller mappings)."
 fi
 
 # Patch the selkies input_handler.py keep-alive loop to check reader.at_eof().

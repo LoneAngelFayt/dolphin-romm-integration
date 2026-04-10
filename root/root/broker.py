@@ -28,12 +28,18 @@ ENV = {
     "WAYLAND_DISPLAY":    "wayland-0",   # labwc Wayland socket; Qt tries this first, falls back to xcb on :0
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
-    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
+    # Both libraries are required: the interposer redirects open() on
+    # /dev/input/* to selkies Unix sockets; the fake libudev makes SDL's
+    # udev-based device enumeration report the virtual Xbox 360 pad so SDL
+    # even tries to open those devices in the first place.
+    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
     "HOME":               "/config",
     "USER":               "abc",
 }
 
-INI_PATH = Path("/config/.config/dolphin-emu/Config/Dolphin.ini")
+# Dolphin on this image writes all config files directly to
+# ~/.config/dolphin-emu/ — there is no Config/ subdirectory.
+INI_PATH = Path("/config/.config/dolphin-emu/Dolphin.ini")
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(), logging.INFO),
