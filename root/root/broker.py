@@ -31,6 +31,9 @@ ENV = {
     # DRI_NODE is needed for hardware acceleration in some environments.
     "DRI_NODE":           os.environ.get("DRI_NODE", ""),
     "DRINODE":            os.environ.get("DRINODE", ""),
+    # Qt6 configuration
+    "QT_QPA_PLATFORM":    "xcb",
+    "QT_PLUGIN_PATH":     "/usr/lib/x86_64-linux-gnu/qt6/plugins",
     # Both libraries are required: the interposer redirects open() on
     # /dev/input/* to selkies Unix sockets; the fake libudev makes SDL's
     # udev-based device enumeration report the virtual Xbox 360 pad so SDL
