@@ -232,7 +232,7 @@ def _diag_window(pid: int):
 
 
 def _monitor_process(proc, start_time):
-    """On unexpected exit, relaunch into dashboard mode if the session is still managed."""
+    """On unexpected exit, relaunch the dashboard if the session is still managed."""
     proc.wait()
     duration = time.monotonic() - start_time
 
@@ -249,11 +249,8 @@ def _monitor_process(proc, start_time):
     with _session_lock:
         if not _session["is_managed"]:
             return
-        _session["rom_path"] = None
-        _session["rom_name"] = "Dashboard"
-        _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    _launch_dolphin_internal(None)
+    _launch_dolphin(None)
 
 
 def _drain_gamepad_sockets():
@@ -495,6 +492,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 active = (
                     _session["process"] is not None
                     and _session["process"].poll() is None
+                    and _session["rom_path"] is not None
                 )
                 snap = dict(_session) if active else {}
             self._send_json(200, {
@@ -695,6 +693,10 @@ def main():
         time.sleep(2)
 
     _patch_ini()
+
+    # Launch Dolphin into its main menu so the stream shows something useful
+    # whenever no game is playing.  Game launches kill this instance first.
+    Thread(target=_launch_dolphin, args=(None,), daemon=True).start()
 
     server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("ROM broker listening on port %d", PORT)
