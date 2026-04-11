@@ -187,8 +187,8 @@ def _launch_dolphin_internal(rom_path):
     try:
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             preexec_fn=os.setpgrp,
         )
     except Exception as exc:
@@ -203,6 +203,18 @@ def _launch_dolphin_internal(rom_path):
         _session["is_managed"] = True
     log.info("Dolphin launched (PID %d)", proc.pid)
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
+    Thread(target=_log_dolphin_output, args=(proc,), daemon=True).start()
+
+
+def _log_dolphin_output(proc):
+    """Log Dolphin stdout/stderr to the broker log for crash diagnosis."""
+    try:
+        for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            if line:
+                log.info("[dolphin] %s", line)
+    except Exception:
+        pass
 
 
 def _monitor_process(proc, start_time):
