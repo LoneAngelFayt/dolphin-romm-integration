@@ -35,6 +35,9 @@ ENV = {
     # DRI_NODE is needed for hardware acceleration in some environments.
     "DRI_NODE":           os.environ.get("DRI_NODE", ""),
     "DRINODE":            os.environ.get("DRINODE", ""),
+    # Force X11 backend — Dolphin renders via Xwayland on :1 which feeds into
+    # wayland-1; no need for the Qt Wayland plugin which may not be installed.
+    "QT_QPA_PLATFORM":    "xcb",
     "QT_PLUGIN_PATH":     "/usr/lib/x86_64-linux-gnu/qt6/plugins",
     # Both libraries are required: the interposer redirects open() on
     # /dev/input/* to selkies Unix sockets; the fake libudev makes SDL's
