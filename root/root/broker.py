@@ -35,11 +35,14 @@ ENV = {
     "DRINODE":            os.environ.get("DRINODE", ""),
     "HOME":               "/config",
     "USER":               "abc",
-    # Bisecting black-screen culprit — test interposer alone first.
-    # If game shows: fake libudev is the problem; try SDL_JOYSTICK_DEVICE instead.
-    # If still black: interposer itself is the problem.
-    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
-    # "LD_PRELOAD":       "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
+    # The joystick interposer hooks open() on /dev/input/* and redirects to
+    # selkies Unix sockets so controller input reaches Dolphin.
+    # libudev.so.1.0.0-fake is intentionally excluded: it intercepts udev calls
+    # that Mesa/DRI uses for GPU enumeration, which causes a black screen.
+    # SDL_JOYSTICK_DEVICE replaces the fake udev approach — SDL reads device
+    # paths directly and still calls open(), triggering the interposer.
+    "LD_PRELOAD":            "/usr/lib/selkies_joystick_interposer.so",
+    "SDL_JOYSTICK_DEVICE":   "/dev/input/js0:/dev/input/js1:/dev/input/js2:/dev/input/js3",
 }
 
 # Dolphin on this image writes all config files directly to
