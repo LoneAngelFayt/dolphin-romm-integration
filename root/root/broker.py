@@ -23,31 +23,36 @@ ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))   # default slot for save-and-exit (1–8)
 SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
+# ── Layer 0: bare minimum — confirm Dolphin creates a visible X11 window ──────
+# Add layers back one at a time until the stream breaks to find the culprit.
 ENV = {
-    # startwm_wayland.sh sets WAYLAND_DISPLAY=wayland-1 before labwc, so labwc
-    # always listens on wayland-1.  Our init.sh clears stale X11 lock files
-    # which lets Xwayland reclaim :0 (the first available slot).  selkies
-    # captures wayland-1 (SELKIES_WAYLAND_SOCKET_INDEX=1 set by init.sh), and
-    # Xwayland's output flows into wayland-1 as a native Wayland client.
-    "DISPLAY":            ":0",
-    "WAYLAND_DISPLAY":    "wayland-1",
-    "XDG_RUNTIME_DIR":    "/config/.XDG",
-    "PULSE_RUNTIME_PATH": "/defaults",
-    # DRI_NODE is needed for hardware acceleration in some environments.
-    "DRI_NODE":           os.environ.get("DRI_NODE", ""),
-    "DRINODE":            os.environ.get("DRINODE", ""),
-    # Force X11 backend — Dolphin renders via Xwayland on :1 which feeds into
-    # wayland-1; no need for the Qt Wayland plugin which may not be installed.
-    "QT_QPA_PLATFORM":    "xcb",
-    "QT_PLUGIN_PATH":     "/usr/lib/x86_64-linux-gnu/qt6/plugins",
-    # Both libraries are required: the interposer redirects open() on
-    # /dev/input/* to selkies Unix sockets; the fake libudev makes SDL's
-    # udev-based device enumeration report the virtual Xbox 360 pad so SDL
-    # even tries to open those devices in the first place.
-    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
-    "HOME":               "/config",
-    "USER":               "abc",
+    "DISPLAY":         ":0",           # Xwayland display (created by labwc/wlroots)
+    "WAYLAND_DISPLAY": "wayland-1",    # pixelflux compositor socket
+    "XDG_RUNTIME_DIR": "/config/.XDG",
+    "HOME":            "/config",
+    "USER":            "abc",
 }
+
+# ── Layer 1: audio / DRI acceleration ─────────────────────────────────────────
+# Uncomment once Layer 0 confirms a visible window:
+# ENV.update({
+#     "PULSE_RUNTIME_PATH": "/defaults",
+#     "DRI_NODE":           os.environ.get("DRI_NODE", ""),
+#     "DRINODE":            os.environ.get("DRINODE", ""),
+# })
+
+# ── Layer 2: force xcb + plugin path ─────────────────────────────────────────
+# Uncomment after Layer 1 is confirmed working:
+# ENV.update({
+#     "QT_QPA_PLATFORM": "xcb",
+#     "QT_PLUGIN_PATH":  "/usr/lib/x86_64-linux-gnu/qt6/plugins",
+# })
+
+# ── Layer 3: LD_PRELOAD (controller interposer + fake libudev) ────────────────
+# Uncomment last — this is the most likely black-screen culprit if layers 0-2 work:
+# ENV["LD_PRELOAD"] = (
+#     "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake"
+# )
 
 # Dolphin on this image writes all config files directly to
 # ~/.config/dolphin-emu/ — there is no Config/ subdirectory.
@@ -201,6 +206,7 @@ def _launch_dolphin_internal(rom_path):
     log.info("Dolphin launched (PID %d)", proc.pid)
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
     Thread(target=_log_dolphin_output, args=(proc,), daemon=True).start()
+    Thread(target=_diag_window, args=(proc.pid,), daemon=True).start()
 
 
 def _log_dolphin_output(proc):
@@ -212,6 +218,26 @@ def _log_dolphin_output(proc):
                 log.info("[dolphin] %s", line)
     except Exception:
         pass
+
+
+def _diag_window(pid: int):
+    """After a short delay, check whether Dolphin has an X11 window via xdotool."""
+    time.sleep(4)
+    try:
+        out = subprocess.check_output(
+            ["sudo", "-u", "abc", "env",
+             f"DISPLAY={ENV['DISPLAY']}", f"HOME={ENV['HOME']}",
+             "xdotool", "search", "--pid", str(pid)],
+            text=True, timeout=10,
+        ).strip()
+        if out:
+            log.info("[diag] Dolphin PID %d has X11 window(s): %s", pid, out)
+        else:
+            log.warning("[diag] Dolphin PID %d has NO X11 windows — check Xwayland/rendering", pid)
+    except subprocess.CalledProcessError:
+        log.warning("[diag] xdotool found no X11 windows for Dolphin PID %d", pid)
+    except Exception as exc:
+        log.warning("[diag] xdotool check failed: %s", exc)
 
 
 def _monitor_process(proc, start_time):
