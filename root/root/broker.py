@@ -35,11 +35,11 @@ ENV = {
     "DRINODE":            os.environ.get("DRINODE", ""),
     "HOME":               "/config",
     "USER":               "abc",
-    # Both libraries required for controller input: the interposer redirects
-    # open() on /dev/input/* to selkies Unix sockets; the fake libudev makes
-    # SDL's udev enumeration report the virtual Xbox 360 pad so SDL calls open()
-    # in the first place.
-    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
+    # Bisecting black-screen culprit — test interposer alone first.
+    # If game shows: fake libudev is the problem; try SDL_JOYSTICK_DEVICE instead.
+    # If still black: interposer itself is the problem.
+    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
+    # "LD_PRELOAD":       "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
 }
 
 # Dolphin on this image writes all config files directly to
