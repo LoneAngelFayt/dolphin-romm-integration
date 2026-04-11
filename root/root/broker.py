@@ -24,19 +24,17 @@ SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))   # default slot for save-and
 SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
 ENV = {
-    # Hardcoded to :0/wayland-0 — the stale-socket cleanup in init.sh ensures
-    # labwc always starts on wayland-0 and Xwayland always claims :0.
-    # Reading these from the container env picks up DISPLAY=:1 (no Xvfb there),
-    # which causes Qt's xcb plugin to fail and renders a black window.
-    "DISPLAY":            ":0",
-    "WAYLAND_DISPLAY":    "wayland-0",
+    # startwm_wayland.sh (linuxserver) explicitly sets WAYLAND_DISPLAY=wayland-1
+    # before starting labwc, so labwc always listens on wayland-1.  Its Xwayland
+    # child registers X11 display :1.  We must match these values or Dolphin
+    # connects to a compositor socket that doesn't exist.
+    "DISPLAY":            ":1",
+    "WAYLAND_DISPLAY":    "wayland-1",
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
     # DRI_NODE is needed for hardware acceleration in some environments.
     "DRI_NODE":           os.environ.get("DRI_NODE", ""),
     "DRINODE":            os.environ.get("DRINODE", ""),
-    # Qt6 configuration
-    "QT_QPA_PLATFORM":    "xcb",
     "QT_PLUGIN_PATH":     "/usr/lib/x86_64-linux-gnu/qt6/plugins",
     # Both libraries are required: the interposer redirects open() on
     # /dev/input/* to selkies Unix sockets; the fake libudev makes SDL's
