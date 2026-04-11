@@ -23,36 +23,24 @@ ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))   # default slot for save-and-exit (1–8)
 SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
-# ── Layer 0: bare minimum — confirm Dolphin creates a visible X11 window ──────
-# Add layers back one at a time until the stream breaks to find the culprit.
 ENV = {
-    "DISPLAY":         ":0",           # Xwayland display (created by labwc/wlroots)
-    "WAYLAND_DISPLAY": "wayland-1",    # pixelflux compositor socket
-    "XDG_RUNTIME_DIR": "/config/.XDG",
-    "HOME":            "/config",
-    "USER":            "abc",
+    # Qt auto-detects the platform correctly — do NOT set QT_QPA_PLATFORM=xcb
+    # or QT_PLUGIN_PATH; the Qt6 xcb plugin in /usr/lib/.../qt6/plugins requires
+    # xcb-cursor0 which is absent in this image, causing a black window.
+    "DISPLAY":            ":0",            # Xwayland display (labwc/wlroots)
+    "WAYLAND_DISPLAY":    "wayland-1",     # pixelflux compositor socket
+    "XDG_RUNTIME_DIR":    "/config/.XDG",
+    "PULSE_RUNTIME_PATH": "/defaults",
+    "DRI_NODE":           os.environ.get("DRI_NODE", ""),
+    "DRINODE":            os.environ.get("DRINODE", ""),
+    "HOME":               "/config",
+    "USER":               "abc",
+    # Both libraries required for controller input: the interposer redirects
+    # open() on /dev/input/* to selkies Unix sockets; the fake libudev makes
+    # SDL's udev enumeration report the virtual Xbox 360 pad so SDL calls open()
+    # in the first place.
+    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
 }
-
-# ── Layer 1: audio / DRI acceleration ─────────────────────────────────────────
-# Uncomment once Layer 0 confirms a visible window:
-# ENV.update({
-#     "PULSE_RUNTIME_PATH": "/defaults",
-#     "DRI_NODE":           os.environ.get("DRI_NODE", ""),
-#     "DRINODE":            os.environ.get("DRINODE", ""),
-# })
-
-# ── Layer 2: force xcb + plugin path ─────────────────────────────────────────
-# Uncomment after Layer 1 is confirmed working:
-# ENV.update({
-#     "QT_QPA_PLATFORM": "xcb",
-#     "QT_PLUGIN_PATH":  "/usr/lib/x86_64-linux-gnu/qt6/plugins",
-# })
-
-# ── Layer 3: LD_PRELOAD (controller interposer + fake libudev) ────────────────
-# Uncomment last — this is the most likely black-screen culprit if layers 0-2 work:
-# ENV["LD_PRELOAD"] = (
-#     "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake"
-# )
 
 # Dolphin on this image writes all config files directly to
 # ~/.config/dolphin-emu/ — there is no Config/ subdirectory.
