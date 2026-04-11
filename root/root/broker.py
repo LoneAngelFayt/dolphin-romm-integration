@@ -24,11 +24,12 @@ SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))   # default slot for save-and
 SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
 ENV = {
-    # startwm_wayland.sh (linuxserver) explicitly sets WAYLAND_DISPLAY=wayland-1
-    # before starting labwc, so labwc always listens on wayland-1.  Its Xwayland
-    # child registers X11 display :1.  We must match these values or Dolphin
-    # connects to a compositor socket that doesn't exist.
-    "DISPLAY":            ":1",
+    # startwm_wayland.sh sets WAYLAND_DISPLAY=wayland-1 before labwc, so labwc
+    # always listens on wayland-1.  Our init.sh clears stale X11 lock files
+    # which lets Xwayland reclaim :0 (the first available slot).  selkies
+    # captures wayland-1 (SELKIES_WAYLAND_SOCKET_INDEX=1 set by init.sh), and
+    # Xwayland's output flows into wayland-1 as a native Wayland client.
+    "DISPLAY":            ":0",
     "WAYLAND_DISPLAY":    "wayland-1",
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
