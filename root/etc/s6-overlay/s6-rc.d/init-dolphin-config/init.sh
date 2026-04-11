@@ -1,18 +1,7 @@
 #!/usr/bin/with-contenv bash
 
-# Clean up stale X11 lock files so Xwayland can reclaim display :1.
-rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
-echo "[broker-mod] Cleaned up stale X11 lock files."
-
-# Tell selkies to capture from wayland-1.  startwm_wayland.sh (linuxserver)
-# hardcodes WAYLAND_DISPLAY=wayland-1 before launching labwc, so labwc always
-# listens on wayland-1 regardless of whether stale sockets are present.
-# selkies defaults to wayland_socket_index=0; override it here so pixelflux
-# connects to the correct compositor for screen capture.
 XDG_RUNTIME_DIR="/config/.XDG"
 mkdir -p "$XDG_RUNTIME_DIR"
-echo -n "1" > /run/s6/container_environment/SELKIES_WAYLAND_SOCKET_INDEX
-echo "[broker-mod] Set SELKIES_WAYLAND_SOCKET_INDEX=1."
 
 # Ensure python3 is available for the broker service.
 if ! command -v python3 &>/dev/null; then

@@ -87,20 +87,16 @@ def _validate_rom_path(raw: str) -> Path | None:
 
 
 def _patch_ini():
-    """Patch Dolphin.ini to ensure fullscreen and no confirm-stop dialog."""
+    """Patch Dolphin.ini to disable the confirm-stop dialog."""
     INI_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not INI_PATH.exists():
-        INI_PATH.write_text(
-            "[Display]\nFullscreen = True\n\n[Interface]\nConfirmStop = False\n\n[Core]\nGFXBackend = OGL\n"
-        )
+        INI_PATH.write_text("[Interface]\nConfirmStop = False\n")
         log.info("Created Dolphin.ini with broker defaults")
         return
 
     target = {
-        "Display":   {"Fullscreen": "True"},
         "Interface": {"ConfirmStop": "False"},
-        "Core":      {"GFXBackend": "OGL"},
     }
 
     try:
@@ -139,7 +135,7 @@ def _patch_ini():
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(INI_PATH)
-        log.debug("Dolphin.ini patched (Fullscreen, ConfirmStop)")
+        log.debug("Dolphin.ini patched (ConfirmStop)")
     except Exception as exc:
         log.error("Failed to patch Dolphin.ini: %s", exc)
 
@@ -682,7 +678,6 @@ def main():
         time.sleep(2)
 
     _patch_ini()
-    _launch_dolphin_internal(None)
 
     server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("ROM broker listening on port %d", PORT)
