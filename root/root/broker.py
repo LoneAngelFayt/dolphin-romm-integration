@@ -24,8 +24,12 @@ SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))   # default slot for save-and
 SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
 ENV = {
-    "DISPLAY":            os.environ.get("DISPLAY", ":0"),
-    "WAYLAND_DISPLAY":    os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
+    # Hardcoded to :0/wayland-0 — the stale-socket cleanup in init.sh ensures
+    # labwc always starts on wayland-0 and Xwayland always claims :0.
+    # Reading these from the container env picks up DISPLAY=:1 (no Xvfb there),
+    # which causes Qt's xcb plugin to fail and renders a black window.
+    "DISPLAY":            ":0",
+    "WAYLAND_DISPLAY":    "wayland-0",
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
     # DRI_NODE is needed for hardware acceleration in some environments.
@@ -664,6 +668,7 @@ def main():
         time.sleep(2)
 
     _patch_ini()
+    _launch_dolphin_internal(None)
 
     server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("ROM broker listening on port %d", PORT)
