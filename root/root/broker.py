@@ -282,45 +282,47 @@ def _monitor_process(proc, start_time):
     _launch_dolphin(None)
 
 
-def _drain_gamepad_sockets():
-    """Send EOF to each selkies gamepad socket before launching a new session.
+def _cleanup_stale_sockets():
+    """Remove only stale/unreachable selkies socket files.
 
-    Connects and immediately sends SHUT_WR so readexactly(1) in the selkies
-    input_handler raises IncompleteReadError — the handler exits cleanly.
-    Socket files that refuse connection are stale and are unlinked.
+    Does NOT send EOF — sending EOF disconnects the browser gamepad client,
+    which breaks input for the new Dolphin instance. The interposer will
+    reconnect to existing sockets automatically; we only clean up sockets
+    that have become orphaned (no listener on the other end).
     """
     paths = sorted(
         glob.glob("/tmp/selkies_js*.sock") + glob.glob("/tmp/selkies_event*.sock")
     )
     if not paths:
-        log.debug("Socket drain: no gamepad sockets found.")
+        log.debug("Socket cleanup: no gamepad sockets found.")
         return
 
-    drained = 0
     removed = 0
     for path in paths:
         try:
             with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
                 s.settimeout(0.3)
                 s.connect(path)
-                s.shutdown(_socket.SHUT_WR)
-            drained += 1
+            log.debug("Socket cleanup: %s is alive, leaving it.", path)
         except OSError:
             try:
                 os.unlink(path)
                 removed += 1
+                log.debug("Socket cleanup: removed stale socket %s", path)
             except OSError:
                 pass
 
-    log.debug(
-        "Socket drain: sent EOF to %d socket(s), removed %d dead file(s) (of %d total).",
-        drained, removed, len(paths),
-    )
+    if removed:
+        log.debug(
+            "Socket cleanup: removed %d stale socket(s) (of %d total).",
+            removed,
+            len(paths),
+        )
 
 
 def _launch_dolphin(rom_path):
     _kill_dolphin()
-    _drain_gamepad_sockets()
+    _cleanup_stale_sockets()
     _patch_ini()
     time.sleep(2)
     with _session_lock:

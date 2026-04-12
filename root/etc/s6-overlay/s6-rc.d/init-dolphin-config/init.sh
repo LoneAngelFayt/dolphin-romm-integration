@@ -77,11 +77,10 @@ done
 # Locate selkies input_handler.py — glob over the python version so the patch
 # survives base image upgrades that bump e.g. python3.12 → python3.13.
 INPUT_HANDLER=$(compgen -G "/lsiopy/lib/python3.*/site-packages/selkies/input_handler.py" | head -1)
-INPUT_HANDLER="${INPUT_HANDLER:-/lsiopy/lib/python3.12/site-packages/selkies/input_handler.py}"
+INPUT_HANDLER="${INPUT_HANDLER:-/lsiopy/lib/python3.13/site-packages/selkies/input_handler.py}"
 if [ -f "$INPUT_HANDLER" ]; then
-    if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
-        echo "[broker-mod] selkies input_handler.py EOF patch already applied."
-    else
+    # Apply EOF detection patch if not already applied.
+    if ! grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
         sed -i \
             's/while self\.running and not writer\.is_closing():/while self.running and not writer.is_closing() and not reader.at_eof():/' \
             "$INPUT_HANDLER" \
@@ -92,9 +91,7 @@ if [ -f "$INPUT_HANDLER" ]; then
     # Silence the selkies_gamepad logger — it emits ~80 INFO lines per launch cycle.
     # Uses python3 for the insertion because sed \n behaviour is not portable across
     # GNU/BSD sed variants and can silently produce a literal '\n' in the file.
-    if grep -q "setLevel(logging.WARNING)" "$INPUT_HANDLER"; then
-        echo "[broker-mod] selkies_gamepad log-level patch already applied."
-    else
+    if ! grep -q "setLevel(logging.WARNING)" "$INPUT_HANDLER"; then
         if python3 - "$INPUT_HANDLER" <<'PYEOF'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1])
@@ -110,6 +107,88 @@ PYEOF
             echo "[broker-mod] Patched selkies_gamepad log level to WARNING."
         else
             echo "[broker-mod] ERROR: python patch failed setting selkies_gamepad log level"
+        fi
+    fi
+
+    # Patch to recreate socket files if they're deleted (e.g., after interposer restart).
+    # Without this, the interposer can't reconnect after Dolphin restarts because the
+    # socket files are deleted when the old interposer dies. The socket servers are
+    # recreated when webrtc_input detects missing socket files.
+    if ! grep -q "# RECREATE_SOCKETS_PATCH" "$INPUT_HANDLER"; then
+        if python3 - "$INPUT_HANDLER" <<'PYEOF'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+
+# Find the async def start() method and add socket monitoring
+if "async def start(self)" not in text:
+    sys.exit(1)
+
+# The patch adds a background task that recreates socket files if they're deleted
+# This is needed because when Dolphin restarts (e.g., loading a game), the interposer
+# dies and webrtc_input closes the sockets. Without this patch, the sockets are deleted
+# and the new interposer can't connect.
+patch_code = '''
+    async def _recreate_sockets_if_needed(self):
+        """Periodically check if socket files exist and recreate them if missing.
+        
+        When Dolphin is restarted (e.g., loading a game), the interposer dies and
+        webrtc_input closes the socket servers. This deletes the socket files, making
+        it impossible for the new interposer to connect. This task recreates the
+        socket files so the interposer can reconnect.
+        """
+        import asyncio
+        while self.running:
+            await asyncio.sleep(0.5)
+            for sock_path in [self.js_sock_path, self.evdev_sock_path]:
+                if not os.path.exists(sock_path):
+                    logger_webrtc_input.warning(
+                        f"Socket file {sock_path} missing, recreating..."
+                    )
+                    try:
+                        if os.path.exists(sock_path):
+                            os.unlink(sock_path)
+                        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        sock.bind(sock_path)
+                        sock.listen(1)
+                        logger_webrtc_input.info(
+                            f"Recreated socket file: {sock_path}"
+                        )
+                    except Exception as e:
+                        logger_webrtc_input.error(
+                            f"Failed to recreate socket {sock_path}: {e}"
+                        )
+
+# RECREATE_SOCKETS_PATCH
+'''
+
+# Insert the new method and start it in start()
+insert_before = "async def start(self):"
+insert_pos = text.find(insert_before)
+if insert_pos == -1:
+    sys.exit(1)
+
+# Add the method before start()
+text = text[:insert_pos] + patch_code + text[insert_pos:]
+
+# Add the task creation in start()
+start_method = "async def start(self):"
+start_body_start = text.find("\n", text.find(start_method)) + 1
+text = (
+    text[:start_body_start]
+    + "\n        # RECREATE_SOCKETS_PATCH: monitor for missing socket files\n"
+    + "        asyncio.create_task(self._recreate_sockets_if_needed())\n\n"
+    + text[start_body_start:]
+)
+
+p.write_text(text)
+print("Applied socket recreation patch", file=sys.stderr)
+sys.exit(0)
+PYEOF
+        then
+            echo "[broker-mod] Patched selkies input_handler.py socket recreation."
+        else
+            echo "[broker-mod] NOTE: socket recreation patch not applied (may already exist or failed)"
         fi
     fi
 else
