@@ -89,7 +89,7 @@ def _patch_ini():
     if not INI_PATH.exists():
         INI_PATH.write_text(
             "[Core]\n"
-            "SIDevice0 = 1\n"
+            "SIDevice0 = 6\n"
             "SIDevice1 = 0\n"
             "SIDevice2 = 0\n"
             "SIDevice3 = 0\n"
@@ -107,7 +107,7 @@ def _patch_ini():
 
     target = {
         "Core": {
-            "SIDevice0": "1",
+            "SIDevice0": "6",
             "SIDevice1": "0",
             "SIDevice2": "0",
             "SIDevice3": "0",

@@ -32,7 +32,7 @@ DOLPHIN_INI="$DOLPHIN_CFG_DIR/Dolphin.ini"
 if [ ! -f "$DOLPHIN_INI" ]; then
     cat > "$DOLPHIN_INI" <<'EOF'
 [Core]
-SIDevice0 = 1
+SIDevice0 = 6
 SIDevice1 = 0
 SIDevice2 = 0
 SIDevice3 = 0
