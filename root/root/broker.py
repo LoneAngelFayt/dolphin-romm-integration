@@ -39,10 +39,10 @@ ENV = {
     # selkies Unix sockets so controller input reaches Dolphin.
     # libudev.so.1.0.0-fake is intentionally excluded: it intercepts udev calls
     # that Mesa/DRI uses for GPU enumeration, which causes a black screen.
-    # SDL_JOYSTICK_DEVICE replaces the fake udev approach — SDL reads device
-    # paths directly and still calls open(), triggering the interposer.
+    # SDL finds the selkies virtual devices via its own /dev/input evdev scan —
+    # SDL_JOYSTICK_DEVICE is NOT set because it would add the js* devices on
+    # top of the evdev scan of the same underlying devices, causing duplicates.
     "LD_PRELOAD":            "/usr/lib/selkies_joystick_interposer.so",
-    "SDL_JOYSTICK_DEVICE":   "/dev/input/js0:/dev/input/js1:/dev/input/js2:/dev/input/js3",
 }
 
 # Dolphin on this image writes all config files directly to
