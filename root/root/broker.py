@@ -89,7 +89,7 @@ def _patch_ini():
     if not INI_PATH.exists():
         INI_PATH.write_text(
             "[Core]\n"
-            "SIDevice0 = 6\n"
+            "SIDevice0 = 1\n"
             "SIDevice1 = 0\n"
             "SIDevice2 = 0\n"
             "SIDevice3 = 0\n"
@@ -97,22 +97,27 @@ def _patch_ini():
             "\n"
             "[Interface]\n"
             "ConfirmStop = False\n"
+            "\n"
+            "[Analytics]\n"
+            "Enabled = False\n"
+            "PermissionAsked = True\n"
         )
         log.info("Created Dolphin.ini with broker defaults")
         return
 
     target = {
-        # SIDevice0=6 → Standard Controller on port 1; ports 2–4 disabled.
-        # Without this, Dolphin defaults all ports to None and ignores GCPad
-        # input even when the device is mapped in GCPadNew.ini.
         "Core": {
-            "SIDevice0": "6",
+            "SIDevice0": "1",
             "SIDevice1": "0",
             "SIDevice2": "0",
             "SIDevice3": "0",
             "BackgroundInput": "True",
         },
         "Interface": {"ConfirmStop": "False"},
+        "Analytics": {
+            "Enabled": "False",
+            "PermissionAsked": "True",
+        },
     }
 
     try:

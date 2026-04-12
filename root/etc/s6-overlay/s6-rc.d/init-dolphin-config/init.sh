@@ -32,7 +32,7 @@ DOLPHIN_INI="$DOLPHIN_CFG_DIR/Dolphin.ini"
 if [ ! -f "$DOLPHIN_INI" ]; then
     cat > "$DOLPHIN_INI" <<'EOF'
 [Core]
-SIDevice0 = 6
+SIDevice0 = 1
 SIDevice1 = 0
 SIDevice2 = 0
 SIDevice3 = 0
@@ -40,6 +40,10 @@ BackgroundInput = True
 
 [Interface]
 ConfirmStop = False
+
+[Analytics]
+Enabled = False
+PermissionAsked = True
 EOF
     echo "[broker-mod] Created default Dolphin.ini."
 fi
