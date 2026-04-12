@@ -83,15 +83,33 @@ def _validate_rom_path(raw: str) -> Path | None:
 
 
 def _patch_ini():
-    """Patch Dolphin.ini to disable the confirm-stop dialog."""
+    """Patch Dolphin.ini to set required broker defaults."""
     INI_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not INI_PATH.exists():
-        INI_PATH.write_text("[Interface]\nConfirmStop = False\n")
+        INI_PATH.write_text(
+            "[Core]\n"
+            "SIDevice0 = 6\n"
+            "SIDevice1 = 0\n"
+            "SIDevice2 = 0\n"
+            "SIDevice3 = 0\n"
+            "\n"
+            "[Interface]\n"
+            "ConfirmStop = False\n"
+        )
         log.info("Created Dolphin.ini with broker defaults")
         return
 
     target = {
+        # SIDevice0=6 → Standard Controller on port 1; ports 2–4 disabled.
+        # Without this, Dolphin defaults all ports to None and ignores GCPad
+        # input even when the device is mapped in GCPadNew.ini.
+        "Core": {
+            "SIDevice0": "6",
+            "SIDevice1": "0",
+            "SIDevice2": "0",
+            "SIDevice3": "0",
+        },
         "Interface": {"ConfirmStop": "False"},
     }
 
