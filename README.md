@@ -50,11 +50,11 @@ In your RomM `config.yml`, enable streaming for GameCube and/or Wii:
 streaming:
   enabled: true
   containers:
-    - platform: gc
-      host: http://<dolphin-host>:8000
+    - platform: ngc
+      host: http://<dolphin-host>:3001
       label: Dolphin
     - platform: wii
-      host: http://<dolphin-host>:8000
+      host: http://<dolphin-host>:3001
       label: Dolphin
 ```
 
