@@ -189,8 +189,12 @@ def _launch_dolphin_internal(rom_path):
         # Use --exec=path (assignment form) so the path is captured as the
         # flag's value. Dolphin does not support '--' as a POSIX end-of-options
         # marker and would treat it as a literal filename.
-        # --batch suppresses the GUI and keeps Dolphin in the foreground.
-        cmd.extend([f"--exec={rom_path}", "--batch"])
+        # --batch is intentionally omitted: it suppresses Dolphin's Qt event
+        # loop, which is where SDL joystick polling happens.  Without the event
+        # loop, controller input never reaches the running game.  Without
+        # --batch, when emulation stops Dolphin returns to its main menu rather
+        # than exiting — this is the desired idle behaviour.
+        cmd.append(f"--exec={rom_path}")
 
     log.info("Launching Dolphin (rom=%s)", rom_path or "dashboard")
     log.debug("Launching: %s", " ".join(cmd))
