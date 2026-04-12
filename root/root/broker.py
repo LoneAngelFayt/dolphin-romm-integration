@@ -93,6 +93,7 @@ def _patch_ini():
             "SIDevice1 = 0\n"
             "SIDevice2 = 0\n"
             "SIDevice3 = 0\n"
+            "BackgroundInput = True\n"
             "\n"
             "[Interface]\n"
             "ConfirmStop = False\n"
@@ -109,6 +110,7 @@ def _patch_ini():
             "SIDevice1": "0",
             "SIDevice2": "0",
             "SIDevice3": "0",
+            "BackgroundInput": "True",
         },
         "Interface": {"ConfirmStop": "False"},
     }
