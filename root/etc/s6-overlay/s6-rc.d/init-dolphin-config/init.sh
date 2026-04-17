@@ -61,15 +61,17 @@ fi
 # Log kernel input device names so we can verify GCPadNew.ini uses the right
 # SDL device name.  Without libudev.so.1.0.0-fake, SDL falls back to sysfs for
 # device names — these are the names it will see.
-echo "[broker-mod] Input device names (for GCPadNew.ini SDL mapping):"
-for node in js0 js1 js2 js3; do
-    name_file="/sys/class/input/${node}/device/name"
-    if [ -f "$name_file" ]; then
-        echo "[broker-mod]   /dev/input/${node}: $(cat "$name_file")"
-    else
-        echo "[broker-mod]   /dev/input/${node}: sysfs name not found"
-    fi
-done
+if [ "${BROKER_LOG_LEVEL,,}" = "debug" ]; then
+    echo "[broker-mod] Input device names (for GCPadNew.ini SDL mapping):"
+    for node in js0 js1 js2 js3; do
+        name_file="/sys/class/input/${node}/device/name"
+        if [ -f "$name_file" ]; then
+            echo "[broker-mod]   /dev/input/${node}: $(cat "$name_file")"
+        else
+            echo "[broker-mod]   /dev/input/${node}: sysfs name not found"
+        fi
+    done
+fi
 
 # Patch the selkies input_handler.py keep-alive loop to check reader.at_eof().
 # Without this, idle gamepad sockets never detect client disconnection because
