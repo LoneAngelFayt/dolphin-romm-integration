@@ -607,11 +607,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 _session["save_in_progress"] = True
             body = self._read_body()
-            slot = body.get("slot", SAVE_SLOT)
-            if not isinstance(slot, int) or not (1 <= slot <= 7):
+            slot = body.get("slot", AUTOSAVE_SLOT)
+            if not isinstance(slot, int) or not (1 <= slot <= 8):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–7"})
+                self._send_json(400, {"error": "slot must be 1–8"})
                 return
             wait = body.get("wait", True)
             if wait:
