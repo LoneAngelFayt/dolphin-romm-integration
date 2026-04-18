@@ -20,8 +20,9 @@ from threading import Thread, Lock
 PORT       = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET     = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
-SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))   # default slot for save-and-exit (1–8)
-SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
+SAVE_SLOT     = int(os.environ.get("SAVE_SLOT", "1"))      # default slot for manual save-and-exit (1–8)
+AUTOSAVE_SLOT = int(os.environ.get("AUTOSAVE_SLOT", "8"))  # slot used for automatic saves on navigate-away
+SSTATE_WAIT   = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
 ENV = {
     "DISPLAY":            ":0",
@@ -183,6 +184,8 @@ def _kill_dolphin():
         _session["is_managed"] = False
         proc = _session["process"]
         _session["process"] = None
+        _session["rom_path"] = None
+        _session["rom_name"] = None
 
     if proc is None or proc.poll() is not None:
         return
@@ -341,6 +344,26 @@ def _cleanup_stale_sockets():
 
 
 def _launch_dolphin(rom_path):
+    # Auto-save before killing the current game (covers both navigate-away and
+    # game-switching).  Skipped when no game is running or a save is already in
+    # progress (e.g. called from /save-and-exit which saves first then kills).
+    with _session_lock:
+        old_game = _session["rom_path"]
+        already_saving = _session["save_in_progress"]
+
+    if old_game is not None and not already_saving:
+        with _session_lock:
+            _session["save_in_progress"] = True
+        try:
+            ok = _xdotool_save_state(AUTOSAVE_SLOT)
+            if ok:
+                log.info("auto-save: saved to slot %d before leaving %s", AUTOSAVE_SLOT, old_game)
+            else:
+                log.warning("auto-save: xdotool failed for slot %d — continuing anyway", AUTOSAVE_SLOT)
+        finally:
+            with _session_lock:
+                _session["save_in_progress"] = False
+
     _kill_dolphin()
     _patch_ini(fullscreen=bool(rom_path))
     time.sleep(2)
@@ -546,10 +569,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 )
                 snap = dict(_session) if active else {}
             self._send_json(200, {
-                "active":     active,
-                "rom_path":   snap.get("rom_path")   if active else None,
-                "rom_name":   snap.get("rom_name")   if active else None,
-                "started_at": snap.get("started_at") if active else None,
+                "active":        active,
+                "rom_path":      snap.get("rom_path")   if active else None,
+                "rom_name":      snap.get("rom_name")   if active else None,
+                "started_at":    snap.get("started_at") if active else None,
+                "autosave_slot": AUTOSAVE_SLOT,
+                "save_slot":     SAVE_SLOT,
             })
         else:
             self._send_json(404, {"error": "not found"})
