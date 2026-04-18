@@ -22,6 +22,10 @@ SECRET     = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 SAVE_SLOT     = int(os.environ.get("SAVE_SLOT", "1"))      # default slot for manual save-and-exit (1–8)
 AUTOSAVE_SLOT = int(os.environ.get("AUTOSAVE_SLOT", "8"))  # slot used for automatic saves on navigate-away
+if not (1 <= SAVE_SLOT <= 8):
+    raise SystemExit(f"SAVE_SLOT must be 1–8, got {SAVE_SLOT}")
+if not (1 <= AUTOSAVE_SLOT <= 8):
+    raise SystemExit(f"AUTOSAVE_SLOT must be 1–8, got {AUTOSAVE_SLOT}")
 SSTATE_WAIT   = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
 ENV = {
@@ -186,6 +190,7 @@ def _kill_dolphin():
         _session["process"] = None
         _session["rom_path"] = None
         _session["rom_name"] = None
+        _session["started_at"] = None
 
     if proc is None or proc.poll() is not None:
         return
@@ -347,17 +352,22 @@ def _launch_dolphin(rom_path):
     # Auto-save before killing the current game (covers both navigate-away and
     # game-switching).  Skipped when no game is running or a save is already in
     # progress (e.g. called from /save-and-exit which saves first then kills).
+    # Read and set save_in_progress atomically to avoid a TOCTOU race with a
+    # concurrent /save-and-exit request.
     with _session_lock:
         old_game = _session["rom_path"]
-        already_saving = _session["save_in_progress"]
-
-    if old_game is not None and not already_saving:
-        with _session_lock:
+        if old_game is not None and not _session["save_in_progress"]:
             _session["save_in_progress"] = True
+            do_autosave = True
+        else:
+            do_autosave = False
+
+    if do_autosave:
         try:
             ok = _xdotool_save_state(AUTOSAVE_SLOT)
             if ok:
-                log.info("auto-save: saved to slot %d before leaving %s", AUTOSAVE_SLOT, old_game)
+                log.info("auto-save: saved to slot %d before leaving %s",
+                         AUTOSAVE_SLOT, Path(old_game).name)
             else:
                 log.warning("auto-save: xdotool failed for slot %d — continuing anyway", AUTOSAVE_SLOT)
         finally:
