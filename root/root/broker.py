@@ -81,9 +81,15 @@ def _validate_rom_path(raw: str) -> Path | None:
     return p
 
 
-def _patch_ini():
-    """Patch Dolphin.ini to set required broker defaults."""
+def _patch_ini(fullscreen: bool = False):
+    """Patch Dolphin.ini to set required broker defaults.
+
+    fullscreen=True when launching a game (fills stream with game content),
+    False for the idle dashboard (windowed, avoids black screen on boot).
+    """
     INI_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    fs_val = "True" if fullscreen else "False"
 
     if not INI_PATH.exists():
         INI_PATH.write_text(
@@ -103,13 +109,13 @@ def _patch_ini():
             "\n"
             "[Display]\n"
             "RenderToMain = True\n"
-            "Fullscreen = True\n"
+            f"Fullscreen = {fs_val}\n"
             "\n"
             "[Analytics]\n"
             "Enabled = False\n"
             "PermissionAsked = True\n"
         )
-        log.info("Created Dolphin.ini with broker defaults")
+        log.info("Created Dolphin.ini with broker defaults (fullscreen=%s)", fullscreen)
         return
 
     target = {
@@ -125,7 +131,7 @@ def _patch_ini():
             "CPUThread": "False",
         },
         "Interface": {"ConfirmStop": "False"},
-        "Display": {"RenderToMain": "True", "Fullscreen": "True"},
+        "Display": {"RenderToMain": "True", "Fullscreen": fs_val},
         "Analytics": {
             "Enabled": "False",
             "PermissionAsked": "True",
@@ -334,7 +340,7 @@ def _cleanup_stale_sockets():
 
 def _launch_dolphin(rom_path):
     _kill_dolphin()
-    _patch_ini()
+    _patch_ini(fullscreen=bool(rom_path))
     time.sleep(2)
     with _session_lock:
         _session["rom_path"] = rom_path

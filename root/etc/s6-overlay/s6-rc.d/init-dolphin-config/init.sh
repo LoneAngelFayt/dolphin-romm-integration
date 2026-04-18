@@ -47,7 +47,7 @@ ConfirmStop = False
 
 [Display]
 RenderToMain = True
-Fullscreen = True
+Fullscreen = False
 
 [Analytics]
 Enabled = False
