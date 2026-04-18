@@ -24,12 +24,10 @@ SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))   # default slot for save-and
 SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
 ENV = {
-    # Qt auto-detects the platform correctly — do NOT set QT_QPA_PLATFORM=xcb
-    # or QT_PLUGIN_PATH; the Qt6 xcb plugin in /usr/lib/.../qt6/plugins requires
-    # xcb-cursor0 which is absent in this image, causing a black window.
-    "DISPLAY":            ":0",            # Xwayland display (labwc/wlroots)
-    "WAYLAND_DISPLAY":    "wayland-1",     # pixelflux compositor socket
+    "DISPLAY":            ":0",
+    "WAYLAND_DISPLAY":    os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
     "XDG_RUNTIME_DIR":    "/config/.XDG",
+    "QT_QPA_PLATFORM":    "xcb",
     "PULSE_RUNTIME_PATH": "/defaults",
     "DRI_NODE":           os.environ.get("DRI_NODE", ""),
     "DRINODE":            os.environ.get("DRINODE", ""),
@@ -37,11 +35,7 @@ ENV = {
     "USER":               "abc",
     # The joystick interposer hooks open() on /dev/input/* and redirects to
     # selkies Unix sockets so controller input reaches Dolphin.
-    # libudev.so.1.0.0-fake is included so SDL enumerates the selkies virtual
-    # devices via libudev (same as the base image sets at container startup).
-    # Note: the black screen risk only applied to OpenGL; with GFXBackend=Vulkan
-    # the fake libudev does not interfere with Mesa/DRI GPU enumeration.
-    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
+    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
 }
 
 # Dolphin on this image writes all config files directly to
@@ -259,21 +253,25 @@ def _log_dolphin_output(proc):
 
 
 def _diag_window(pid: int):
-    """After a short delay, check whether Dolphin has an X11 window via xdotool."""
+    """After a short delay, check whether Dolphin has an X11 window via xdotool.
+
+    Uses classname search rather than --pid because proc.pid is the sudo wrapper,
+    not the actual dolphin-emu process, so --pid never finds the window.
+    """
     time.sleep(4)
     try:
         out = subprocess.check_output(
             ["sudo", "-u", "abc", "env",
              f"DISPLAY={ENV['DISPLAY']}", f"HOME={ENV['HOME']}",
-             "xdotool", "search", "--pid", str(pid)],
+             "xdotool", "search", "--classname", "dolphin-emu"],
             text=True, timeout=10,
         ).strip()
         if out:
-            log.info("[diag] Dolphin PID %d has X11 window(s): %s", pid, out)
+            log.info("[diag] Dolphin has X11 window(s): %s", out)
         else:
-            log.warning("[diag] Dolphin PID %d has NO X11 windows — check Xwayland/rendering", pid)
+            log.warning("[diag] Dolphin has NO X11 windows (sudo PID %d) — check Xwayland/rendering", pid)
     except subprocess.CalledProcessError:
-        log.warning("[diag] xdotool found no X11 windows for Dolphin PID %d", pid)
+        log.warning("[diag] xdotool found no X11 windows for Dolphin (sudo PID %d)", pid)
     except Exception as exc:
         log.warning("[diag] xdotool check failed: %s", exc)
 
