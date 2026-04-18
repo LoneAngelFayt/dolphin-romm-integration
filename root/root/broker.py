@@ -239,6 +239,54 @@ def _launch_dolphin_internal(rom_path):
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
     Thread(target=_log_dolphin_output, args=(proc,), daemon=True).start()
     Thread(target=_diag_window, args=(proc.pid,), daemon=True).start()
+    if rom_path:
+        Thread(target=_raise_game_window, daemon=True).start()
+
+
+def _raise_game_window():
+    """Wait for the game render window and raise/fullscreen it.
+
+    With QT_QPA_PLATFORM=xcb + Vulkan, Dolphin creates a separate render window
+    that sits behind the main Qt menu window.  The game render window has a title
+    of the form "Dolphin ... | JIT64 ... | <game name>" (contains " | ").
+    We poll until it appears, then raise it and request fullscreen via EWMH.
+    """
+    xdo_base = (
+        ["sudo", "-u", "abc", "env"]
+        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
+        + ["xdotool"]
+    )
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        time.sleep(1)
+        try:
+            ids = subprocess.check_output(
+                xdo_base + ["search", "--classname", "dolphin-emu"],
+                text=True, timeout=5,
+            ).strip().split()
+        except Exception:
+            continue
+        for wid in ids:
+            try:
+                title = subprocess.check_output(
+                    xdo_base + ["getwindowname", wid],
+                    text=True, timeout=3,
+                ).strip()
+            except Exception:
+                continue
+            if " | " in title:
+                log.info("[raise] Game window %s found: %s", wid, title)
+                try:
+                    subprocess.run(xdo_base + ["windowraise", wid], timeout=5)
+                    subprocess.run(
+                        xdo_base + ["windowstate", "--add", "FULLSCREEN", wid],
+                        timeout=5,
+                    )
+                    log.info("[raise] Raised and fullscreened game window %s", wid)
+                except Exception as exc:
+                    log.warning("[raise] Could not fullscreen game window %s: %s", wid, exc)
+                return
+    log.warning("[raise] Game render window not found within 20 seconds")
 
 
 def _log_dolphin_output(proc):
