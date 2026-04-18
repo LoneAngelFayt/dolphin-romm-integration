@@ -290,18 +290,18 @@ def _raise_game_window():
 
         if game_wid and menu_wid:
             try:
+                # Map the game window first — Dolphin's Vulkan render window may
+                # start unmapped; windowstate FULLSCREEN causes labwc to unmap it
+                # and fail to remap, leaving a black screen.  Map it explicitly.
+                subprocess.run(xdo_base + ["windowmap", game_wid], timeout=5)
+                log.info("[raise] Mapped game window %s", game_wid)
+            except Exception as exc:
+                log.warning("[raise] Could not map game window %s: %s", game_wid, exc)
+            try:
                 subprocess.run(xdo_base + ["windowminimize", menu_wid], timeout=5)
                 log.info("[raise] Minimized main menu window %s", menu_wid)
             except Exception as exc:
                 log.warning("[raise] Could not minimize menu window %s: %s", menu_wid, exc)
-            try:
-                subprocess.run(
-                    xdo_base + ["windowstate", "--add", "FULLSCREEN", game_wid],
-                    timeout=5,
-                )
-                log.info("[raise] Set game window %s to fullscreen", game_wid)
-            except Exception as exc:
-                log.warning("[raise] Could not fullscreen game window %s: %s", game_wid, exc)
             return
 
     log.warning("[raise] Game render window not found within 20 seconds")
