@@ -322,7 +322,6 @@ def _cleanup_stale_sockets():
 
 def _launch_dolphin(rom_path):
     _kill_dolphin()
-    _cleanup_stale_sockets()
     _patch_ini()
     time.sleep(2)
     with _session_lock:
@@ -724,6 +723,11 @@ def main():
         time.sleep(2)
 
     _patch_ini()
+
+    # Clean up any leftover selkies socket files from a previous container run.
+    # Only done once at startup — not on game launches, where webrtc_input is
+    # already running and manages its own socket lifecycle.
+    _cleanup_stale_sockets()
 
     # Launch Dolphin into its main menu so the stream shows something useful
     # whenever no game is playing.  Game launches kill this instance first.
