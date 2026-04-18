@@ -25,7 +25,11 @@ SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait aft
 
 ENV = {
     "DISPLAY":            ":0",
-    "WAYLAND_DISPLAY":    os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
+    # WAYLAND_DISPLAY intentionally omitted: if set, Dolphin's Vulkan backend
+    # creates a VK_KHR_wayland_surface and renders directly to the Wayland
+    # compositor, leaving the X11 window black.  Without it, Vulkan uses
+    # VK_KHR_xcb_surface and renders into the X11 window that Xwayland
+    # composites into labwc — which is what selkies captures.
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "QT_QPA_PLATFORM":    "xcb",
     "PULSE_RUNTIME_PATH": "/defaults",
