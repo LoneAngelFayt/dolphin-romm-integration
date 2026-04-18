@@ -244,12 +244,13 @@ def _launch_dolphin_internal(rom_path):
 
 
 def _raise_game_window():
-    """Wait for the game render window and raise/fullscreen it.
+    """Minimize the main Dolphin Qt window once the game render window appears.
 
-    With QT_QPA_PLATFORM=xcb + Vulkan, Dolphin creates a separate render window
-    that sits behind the main Qt menu window.  The game render window has a title
-    of the form "Dolphin ... | JIT64 ... | <game name>" (contains " | ").
-    We poll until it appears, then raise it and request fullscreen via EWMH.
+    With QT_QPA_PLATFORM=xcb + Vulkan, Dolphin creates a separate top-level
+    render window (title: "Dolphin ... | JIT64 ... | <game>") that sits below
+    the main Qt menu window in the X11 stacking order.  labwc re-raises the
+    focused window, so windowraise doesn't stick.  The reliable fix is to
+    minimize (iconify) the main menu window so only the render window is visible.
     """
     xdo_base = (
         ["sudo", "-u", "abc", "env"]
@@ -266,6 +267,9 @@ def _raise_game_window():
             ).strip().split()
         except Exception:
             continue
+
+        game_wid = None
+        menu_wid = None
         for wid in ids:
             try:
                 title = subprocess.check_output(
@@ -275,17 +279,27 @@ def _raise_game_window():
             except Exception:
                 continue
             if " | " in title:
-                log.info("[raise] Game window %s found: %s", wid, title)
-                try:
-                    subprocess.run(xdo_base + ["windowraise", wid], timeout=5)
-                    subprocess.run(
-                        xdo_base + ["windowstate", "--add", "FULLSCREEN", wid],
-                        timeout=5,
-                    )
-                    log.info("[raise] Raised and fullscreened game window %s", wid)
-                except Exception as exc:
-                    log.warning("[raise] Could not fullscreen game window %s: %s", wid, exc)
-                return
+                game_wid = wid
+                log.info("[raise] Game render window %s: %s", wid, title)
+            elif title.startswith("Dolphin"):
+                menu_wid = wid
+
+        if game_wid and menu_wid:
+            try:
+                subprocess.run(xdo_base + ["windowminimize", menu_wid], timeout=5)
+                log.info("[raise] Minimized main menu window %s", menu_wid)
+            except Exception as exc:
+                log.warning("[raise] Could not minimize menu window %s: %s", menu_wid, exc)
+            try:
+                subprocess.run(
+                    xdo_base + ["windowstate", "--add", "FULLSCREEN", game_wid],
+                    timeout=5,
+                )
+                log.info("[raise] Set game window %s to fullscreen", game_wid)
+            except Exception as exc:
+                log.warning("[raise] Could not fullscreen game window %s: %s", game_wid, exc)
+            return
+
     log.warning("[raise] Game render window not found within 20 seconds")
 
 
