@@ -20,12 +20,10 @@ from threading import Thread, Lock
 PORT       = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET     = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
-SAVE_SLOT     = int(os.environ.get("SAVE_SLOT", "1"))      # default slot for manual save-and-exit (1–8)
-AUTOSAVE_SLOT = int(os.environ.get("AUTOSAVE_SLOT", "8"))  # slot used for automatic saves on navigate-away
-if not (1 <= SAVE_SLOT <= 8):
-    raise SystemExit(f"SAVE_SLOT must be 1–8, got {SAVE_SLOT}")
-if not (1 <= AUTOSAVE_SLOT <= 8):
-    raise SystemExit(f"AUTOSAVE_SLOT must be 1–8, got {AUTOSAVE_SLOT}")
+SAVE_SLOT     = int(os.environ.get("SAVE_SLOT", "1"))  # default slot for manual save-and-exit (1–7)
+AUTOSAVE_SLOT = 8                                       # slot 8 is reserved exclusively for auto-saves
+if not (1 <= SAVE_SLOT <= 7):
+    raise SystemExit(f"SAVE_SLOT must be 1–7, got {SAVE_SLOT}")
 SSTATE_WAIT   = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
 ENV = {
@@ -610,10 +608,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 _session["save_in_progress"] = True
             body = self._read_body()
             slot = body.get("slot", SAVE_SLOT)
-            if not isinstance(slot, int) or not (1 <= slot <= 8):
+            if not isinstance(slot, int) or not (1 <= slot <= 7):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–8"})
+                self._send_json(400, {"error": "slot must be 1–7"})
                 return
             wait = body.get("wait", True)
             if wait:
@@ -680,10 +678,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 _session["save_in_progress"] = True
             body = self._read_body()
             slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 8):
+            if not isinstance(slot, int) or not (1 <= slot <= 7):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–8"})
+                self._send_json(400, {"error": "slot must be 1–7"})
                 return
 
             def _bg_save(s):
@@ -706,8 +704,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
             body = self._read_body()
             slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 8):
-                self._send_json(400, {"error": "slot must be 1–8"})
+            if not isinstance(slot, int) or not (1 <= slot <= 7):
+                self._send_json(400, {"error": "slot must be 1–7"})
                 return
             ok = _xdotool_load_state(slot)
             self._send_json(200 if ok else 500, {"status": "ok" if ok else "error", "loaded": ok, "slot": slot})
