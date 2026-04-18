@@ -102,6 +102,7 @@ def _patch_ini():
             "ConfirmStop = False\n"
             "\n"
             "[Display]\n"
+            "RenderToMain = True\n"
             "Fullscreen = True\n"
             "\n"
             "[Analytics]\n"
@@ -124,7 +125,7 @@ def _patch_ini():
             "CPUThread": "False",
         },
         "Interface": {"ConfirmStop": "False"},
-        "Display": {"Fullscreen": "True"},
+        "Display": {"RenderToMain": "True", "Fullscreen": "True"},
         "Analytics": {
             "Enabled": "False",
             "PermissionAsked": "True",

@@ -46,6 +46,7 @@ CPUThread = False
 ConfirmStop = False
 
 [Display]
+RenderToMain = True
 Fullscreen = True
 
 [Analytics]
