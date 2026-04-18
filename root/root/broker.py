@@ -37,12 +37,11 @@ ENV = {
     "USER":               "abc",
     # The joystick interposer hooks open() on /dev/input/* and redirects to
     # selkies Unix sockets so controller input reaches Dolphin.
-    # libudev.so.1.0.0-fake is intentionally excluded: it intercepts udev calls
-    # that Mesa/DRI uses for GPU enumeration, which causes a black screen.
-    # SDL finds the selkies virtual devices via its own /dev/input evdev scan —
-    # SDL_JOYSTICK_DEVICE is NOT set because it would add the js* devices on
-    # top of the evdev scan of the same underlying devices, causing duplicates.
-    "LD_PRELOAD":            "/usr/lib/selkies_joystick_interposer.so",
+    # libudev.so.1.0.0-fake is included so SDL enumerates the selkies virtual
+    # devices via libudev (same as the base image sets at container startup).
+    # Note: the black screen risk only applied to OpenGL; with GFXBackend=Vulkan
+    # the fake libudev does not interfere with Mesa/DRI GPU enumeration.
+    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
 }
 
 # Dolphin on this image writes all config files directly to
@@ -88,15 +87,22 @@ def _patch_ini():
 
     if not INI_PATH.exists():
         INI_PATH.write_text(
+            "[General]\n"
+            "BackgroundInput = True\n"
+            "\n"
             "[Core]\n"
             "SIDevice0 = 6\n"
             "SIDevice1 = 0\n"
             "SIDevice2 = 0\n"
             "SIDevice3 = 0\n"
-            "BackgroundInput = True\n"
+            "GFXBackend = Vulkan\n"
+            "CPUThread = False\n"
             "\n"
             "[Interface]\n"
             "ConfirmStop = False\n"
+            "\n"
+            "[Display]\n"
+            "Fullscreen = True\n"
             "\n"
             "[Analytics]\n"
             "Enabled = False\n"
@@ -106,14 +112,19 @@ def _patch_ini():
         return
 
     target = {
+        "General": {
+            "BackgroundInput": "True",
+        },
         "Core": {
             "SIDevice0": "6",
             "SIDevice1": "0",
             "SIDevice2": "0",
             "SIDevice3": "0",
-            "BackgroundInput": "True",
+            "GFXBackend": "Vulkan",
+            "CPUThread": "False",
         },
         "Interface": {"ConfirmStop": "False"},
+        "Display": {"Fullscreen": "True"},
         "Analytics": {
             "Enabled": "False",
             "PermissionAsked": "True",

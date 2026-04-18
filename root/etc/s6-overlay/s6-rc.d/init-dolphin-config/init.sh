@@ -31,15 +31,22 @@ mkdir -p "$DOLPHIN_CFG_DIR"
 DOLPHIN_INI="$DOLPHIN_CFG_DIR/Dolphin.ini"
 if [ ! -f "$DOLPHIN_INI" ]; then
     cat > "$DOLPHIN_INI" <<'EOF'
+[General]
+BackgroundInput = True
+
 [Core]
 SIDevice0 = 6
 SIDevice1 = 0
 SIDevice2 = 0
 SIDevice3 = 0
-BackgroundInput = True
+GFXBackend = Vulkan
+CPUThread = False
 
 [Interface]
 ConfirmStop = False
+
+[Display]
+Fullscreen = True
 
 [Analytics]
 Enabled = False
