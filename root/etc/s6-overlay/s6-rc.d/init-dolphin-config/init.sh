@@ -39,7 +39,7 @@ SIDevice0 = 6
 SIDevice1 = 0
 SIDevice2 = 0
 SIDevice3 = 0
-GFXBackend = Vulkan
+GFXBackend = OpenGL
 CPUThread = False
 
 [Interface]
