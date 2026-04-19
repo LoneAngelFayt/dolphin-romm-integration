@@ -704,8 +704,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
             body = self._read_body()
             slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 7):
-                self._send_json(400, {"error": "slot must be 1–7"})
+            if not isinstance(slot, int) or not (1 <= slot <= 8):
+                self._send_json(400, {"error": "slot must be 1–8"})
                 return
             ok = _xdotool_load_state(slot)
             self._send_json(200 if ok else 500, {"status": "ok" if ok else "error", "loaded": ok, "slot": slot})
