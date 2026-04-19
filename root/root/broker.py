@@ -20,8 +20,11 @@ from threading import Thread, Lock
 PORT       = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET     = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
-SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))   # default slot for save-and-exit (1–8)
-SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
+SAVE_SLOT     = int(os.environ.get("SAVE_SLOT", "1"))  # default slot for manual save-and-exit (1–7)
+AUTOSAVE_SLOT = 8                                       # slot 8 is reserved exclusively for auto-saves
+if not (1 <= SAVE_SLOT <= 7):
+    raise SystemExit(f"SAVE_SLOT must be 1–7, got {SAVE_SLOT}")
+SSTATE_WAIT   = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
 ENV = {
     "DISPLAY":            ":0",
@@ -183,6 +186,9 @@ def _kill_dolphin():
         _session["is_managed"] = False
         proc = _session["process"]
         _session["process"] = None
+        _session["rom_path"] = None
+        _session["rom_name"] = None
+        _session["started_at"] = None
 
     if proc is None or proc.poll() is not None:
         return
@@ -341,6 +347,31 @@ def _cleanup_stale_sockets():
 
 
 def _launch_dolphin(rom_path):
+    # Auto-save before killing the current game (covers both navigate-away and
+    # game-switching).  Skipped when no game is running or a save is already in
+    # progress (e.g. called from /save-and-exit which saves first then kills).
+    # Read and set save_in_progress atomically to avoid a TOCTOU race with a
+    # concurrent /save-and-exit request.
+    with _session_lock:
+        old_game = _session["rom_path"]
+        if old_game is not None and not _session["save_in_progress"]:
+            _session["save_in_progress"] = True
+            do_autosave = True
+        else:
+            do_autosave = False
+
+    if do_autosave:
+        try:
+            ok = _xdotool_save_state(AUTOSAVE_SLOT)
+            if ok:
+                log.info("auto-save: saved to slot %d before leaving %s",
+                         AUTOSAVE_SLOT, Path(old_game).name)
+            else:
+                log.warning("auto-save: xdotool failed for slot %d — continuing anyway", AUTOSAVE_SLOT)
+        finally:
+            with _session_lock:
+                _session["save_in_progress"] = False
+
     _kill_dolphin()
     _patch_ini(fullscreen=bool(rom_path))
     time.sleep(2)
@@ -546,10 +577,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 )
                 snap = dict(_session) if active else {}
             self._send_json(200, {
-                "active":     active,
-                "rom_path":   snap.get("rom_path")   if active else None,
-                "rom_name":   snap.get("rom_name")   if active else None,
-                "started_at": snap.get("started_at") if active else None,
+                "active":        active,
+                "rom_path":      snap.get("rom_path")   if active else None,
+                "rom_name":      snap.get("rom_name")   if active else None,
+                "started_at":    snap.get("started_at") if active else None,
+                "autosave_slot": AUTOSAVE_SLOT,
+                "save_slot":     SAVE_SLOT,
             })
         else:
             self._send_json(404, {"error": "not found"})
@@ -574,7 +607,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 _session["save_in_progress"] = True
             body = self._read_body()
-            slot = body.get("slot", SAVE_SLOT)
+            slot = body.get("slot", AUTOSAVE_SLOT)
             if not isinstance(slot, int) or not (1 <= slot <= 8):
                 with _session_lock:
                     _session["save_in_progress"] = False
@@ -645,10 +678,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 _session["save_in_progress"] = True
             body = self._read_body()
             slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 8):
+            if not isinstance(slot, int) or not (1 <= slot <= 7):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–8"})
+                self._send_json(400, {"error": "slot must be 1–7"})
                 return
 
             def _bg_save(s):
