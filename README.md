@@ -12,7 +12,8 @@ An S6 service (`svc-broker`) runs `broker.py` as root inside the container. The 
 
 1. Kills any stale Dolphin process on startup, then launches Dolphin in dashboard mode.
 2. Accepts HTTP requests from the RomM backend to launch ROMs, save/load state, set volume, and stop sessions.
-3. Monitors the Dolphin process and relaunches it into dashboard mode if it exits unexpectedly.
+3. Auto-saves to the reserved auto-save slot whenever a game is exited or switched.
+4. Monitors the Dolphin process and relaunches it into dashboard mode if it exits unexpectedly.
 
 ---
 
@@ -29,7 +30,7 @@ services:
       - ROM_ROOT=/romm/library
       - BROKER_PORT=8000          # optional, default 8000
       - BROKER_SECRET=            # optional shared secret
-      - SAVE_SLOT=1               # default slot for save-and-exit (1–8)
+      - SSTATE_WAIT=3.0           # optional, seconds to wait after save key
       - BROKER_LOG_LEVEL=INFO     # DEBUG for verbose output
     ports:
       - 3000:3000   # WebRTC stream
@@ -56,6 +57,9 @@ streaming:
     - platform: wii
       host: http://<dolphin-host>:3001
       label: Dolphin
+    - platform: wiiu
+      host: http://<dolphin-host>:3001
+      label: Dolphin
 ```
 
 ---
@@ -67,24 +71,26 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
-| `GET` | `/status` | Current session info |
+| `GET` | `/status` | Current session info including slot config |
 | `POST` | `/launch` | Launch a ROM (`{"rom_path": "..."}`) |
 | `DELETE` | `/launch` | Return to Dolphin dashboard |
-| `POST` | `/save-and-exit` | Save state then stop game (`{"slot": 1, "wait": true}`) |
-| `POST` | `/save-state` | Save to slot in background (`{"slot": 1}`) |
-| `POST` | `/load-state` | Load from slot (`{"slot": 1}`) |
+| `POST` | `/save-and-exit` | Save to auto-save slot then stop game (`{"slot": 8, "wait": true}`) |
+| `POST` | `/save-state` | Save to a user slot in background (`{"slot": 1}`) |
+| `POST` | `/load-state` | Load from a slot (`{"slot": 1}`) |
 | `POST` | `/volume` | Set PulseAudio volume (`{"level": 80}`) |
 | `POST` | `/mute` | Mute/unmute (`{"mute": true}` or `{}` to toggle) |
 | `POST` | `/cleanup` | Restart selkies to flush stale gamepad connections |
 
 ### Save State Slots
 
-Dolphin supports **8 save state slots** (1–8). Each slot maps directly to a hotkey:
+Dolphin supports 8 save state slots. **Slot 8 is reserved exclusively for auto-saves** and is not shown in the RomM slot selector.
 
-| Action | Slots | Hotkey |
-|--------|-------|--------|
-| Save | 1–8 | `Shift+F1` – `Shift+F8` |
-| Load | 1–8 | `F1` – `F8` |
+| Action | User slots | Auto-save slot | Hotkey |
+|--------|-----------|---------------|--------|
+| Save | 1–7 | 8 (auto only) | `Shift+F1` – `Shift+F8` |
+| Load | 1–7 | 8 (load autosave button) | `F1` – `F8` |
+
+**Auto-save behaviour:** slot 8 is written automatically whenever you navigate away from a game (switch titles or click save-and-exit). The "load autosave" button in the RomM player always loads slot 8.
 
 ---
 
@@ -93,24 +99,69 @@ Dolphin supports **8 save state slots** (1–8). Each slot maps directly to a ho
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BROKER_PORT` | `8000` | HTTP port the broker listens on |
-| `BROKER_SECRET` | _(empty)_ | Shared secret for request auth |
+| `BROKER_SECRET` | _(empty)_ | Shared secret for request auth (`X-Broker-Secret` header) |
 | `ROM_ROOT` | `/romm/library` | ROM files must be within this path |
-| `SAVE_SLOT` | `1` | Default slot used by `/save-and-exit` |
 | `SSTATE_WAIT` | `3.0` | Seconds to wait after save key before killing Dolphin |
 | `BROKER_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`) |
+
+---
+
+## Controller Setup
+
+The mod uses the [selkies joystick interposer](https://github.com/selkies-project/selkies-gstreamer) to forward browser gamepad input into the container as virtual Xbox 360 pads (`SDL/0–3/Microsoft X-Box 360 pad`).
+
+### Default mapping
+
+All four GCPad ports are pre-mapped to the selkies virtual device on first launch. The mapping is seeded from `/defaults/GCPadNew.ini` only if no existing config is present, so your customisations are never overwritten.
+
+### Calibration
+
+The selkies virtual controller uses a **circular gate** (values come from the browser Gamepad API which clamps to a unit circle). Dolphin's default calibration assumes a square gate and sets diagonal range to `141.42`, which causes the stick to appear short on NW/NE/SW/SE axes.
+
+**Fix:** all 8 calibration points should be `100.00`. Edit `GCPadNew.ini` directly on the host volume:
+
+```
+Main Stick/Calibration = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
+C-Stick/Calibration   = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
+```
+
+The file is at `<your-config-volume>/.config/dolphin-emu/GCPadNew.ini`. Restart the container after editing.
+
+### Persisting controller config
+
+Controller mapping and calibration are stored in the `/config` volume and survive game switches. Dolphin does **not** auto-save controller settings on exit — you must click the **Close** button (not just OK) in Dolphin's controller settings dialog to write changes to disk.
+
+---
+
+## Display
+
+The mod forces the following rendering configuration for correct selkies capture:
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| `GFXBackend` | `OpenGL` | Vulkan activates Wayland WSI when `WAYLAND_DISPLAY` is set, bypassing X11 |
+| `RenderToMain` | `False` | `True` creates an unmapped render window in this Dolphin build |
+| `QT_QPA_PLATFORM` | `xcb` | Forces Qt to use XCB; without this Qt falls back to a broken Wayland path |
+| `WAYLAND_DISPLAY` | _(unset)_ | Must not be set; causes Dolphin to render directly to Wayland, leaving X11 black |
+| `Fullscreen` | `True` (game) / `False` (dashboard) | Prevents black screen on idle boot |
+
+These are applied by the broker on every Dolphin launch and cannot be overridden via Dolphin's GUI.
 
 ---
 
 ## Troubleshooting
 
 **Game launches but screen is black**
-Dolphin may take a few seconds to initialise. The WebRTC stream continues once the game renders its first frame.
+Dolphin may take a few seconds to initialise. If black screen persists, check that `WAYLAND_DISPLAY` is not set in your container environment and that no other mod is injecting a fake libudev.
 
-**Save state doesn't load**
-Verify the slot number matches the one used when saving. Slots are per-game in Dolphin — a save from one game cannot be loaded in another.
+**Save state doesn't work**
+The broker sends xdotool keystrokes to the Dolphin window. If save/load appears to do nothing, check the broker logs for xdotool errors (`docker logs <container> | grep xdotool`). The game must be fully loaded before state operations work.
+
+**Stick doesn't reach full range on diagonals**
+See the [Calibration](#calibration) section above. The default `141.42` diagonal values must be changed to `100.00`.
 
 **Volume controls have no effect**
-The broker controls PulseAudio sink volume for the `abc` user. Verify PulseAudio is running in the container (`pactl info`).
+The broker controls PulseAudio sink volume for the `abc` user. Verify PulseAudio is running in the container (`docker exec <container> pactl info`).
 
-**xdotool key delivery fails**
-The broker targets the Dolphin window by PID. If Dolphin is still initialising when a keypress is sent, the window may not yet be visible. Wait until the game is fully loaded before using save/load state.
+**Controller input stops working after game switch**
+This is prevented by `BackgroundInput = True` in `Dolphin.ini` (set automatically by the broker). If input drops, check the broker log for socket cleanup warnings.
