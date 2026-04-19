@@ -106,33 +106,6 @@ Dolphin supports 8 save state slots. **Slot 8 is reserved exclusively for auto-s
 
 ---
 
-## Controller Setup
-
-The mod uses the [selkies joystick interposer](https://github.com/selkies-project/selkies-gstreamer) to forward browser gamepad input into the container as virtual Xbox 360 pads (`SDL/0–3/Microsoft X-Box 360 pad`).
-
-### Default mapping
-
-All four GCPad ports are pre-mapped to the selkies virtual device on first launch. The mapping is seeded from `/defaults/GCPadNew.ini` only if no existing config is present, so your customisations are never overwritten.
-
-### Calibration
-
-The selkies virtual controller uses a **circular gate** (values come from the browser Gamepad API which clamps to a unit circle). Dolphin's default calibration assumes a square gate and sets diagonal range to `141.42`, which causes the stick to appear short on NW/NE/SW/SE axes.
-
-**Fix:** all 8 calibration points should be `100.00`. Edit `GCPadNew.ini` directly on the host volume:
-
-```
-Main Stick/Calibration = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
-C-Stick/Calibration   = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
-```
-
-The file is at `<your-config-volume>/.config/dolphin-emu/GCPadNew.ini`. Restart the container after editing.
-
-### Persisting controller config
-
-Controller mapping and calibration are stored in the `/config` volume and survive game switches. Dolphin does **not** auto-save controller settings on exit — you must click the **Close** button (not just OK) in Dolphin's controller settings dialog to write changes to disk.
-
----
-
 ## Display
 
 The mod forces the following rendering configuration for correct selkies capture:
