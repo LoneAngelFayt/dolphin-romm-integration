@@ -93,9 +93,14 @@ if [ -f "$INPUT_HANDLER" ]; then
     if ! grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
         sed -i \
             's/while self\.running and not writer\.is_closing():/while self.running and not writer.is_closing() and not reader.at_eof():/' \
-            "$INPUT_HANDLER" \
-            || echo "[broker-mod] ERROR: sed patch failed on input_handler.py"
-        echo "[broker-mod] Patched selkies input_handler.py EOF detection."
+            "$INPUT_HANDLER"
+        # Verify the substitution actually took — sed exits 0 even when the
+        # pattern never matched, so grep is the only honest success signal.
+        if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
+            echo "[broker-mod] Patched selkies input_handler.py EOF detection."
+        else
+            echo "[broker-mod] ERROR: input_handler.py EOF pattern not found — patch NOT applied (upstream may have changed)"
+        fi
     fi
 
     # Silence the selkies_gamepad logger — it emits ~80 INFO lines per launch cycle.

@@ -11,7 +11,7 @@ import socket as _socket
 import subprocess
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread, Lock
 
@@ -24,7 +24,17 @@ SAVE_SLOT     = int(os.environ.get("SAVE_SLOT", "1"))  # default slot for manual
 AUTOSAVE_SLOT = 8                                       # slot 8 is reserved exclusively for auto-saves
 if not (1 <= SAVE_SLOT <= 7):
     raise SystemExit(f"SAVE_SLOT must be 1–7, got {SAVE_SLOT}")
-SSTATE_WAIT   = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
+# Max seconds to poll for the savestate write to complete after the save key.
+# Returns as soon as the file size is stable, so raising this only affects the
+# failure path. Falls back to a fixed 3 s sleep if the StateSaves dir is absent.
+SSTATE_WAIT   = float(os.environ.get("SSTATE_WAIT", "10.0"))
+
+# Dolphin writes savestates to StateSaves under its data dir; the location
+# varies by build (XDG vs. non-XDG layout), so both are probed at save time.
+_SSTATE_DIR_CANDIDATES = (
+    Path("/config/.local/share/dolphin-emu/StateSaves"),
+    Path("/config/.config/dolphin-emu/StateSaves"),
+)
 
 ENV = {
     "DISPLAY":            ":0",
@@ -48,6 +58,13 @@ ENV = {
 # Dolphin on this image writes all config files directly to
 # ~/.config/dolphin-emu/ — there is no Config/ subdirectory.
 INI_PATH = Path("/config/.config/dolphin-emu/Dolphin.ini")
+
+# Dolphin's stdout/stderr is redirected at fd level to this file. A Python
+# reader thread on a PIPE is not used: if the reader dies, Dolphin blocks
+# forever once the 64 KB pipe buffer fills.
+DOLPHIN_LOG_PATH = Path(os.environ.get("DOLPHIN_LOG_PATH", "/config/dolphin.log"))
+_LOG_UID = int(os.environ.get("PUID", "1000"))
+_LOG_GID = int(os.environ.get("PGID", "1000"))
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -88,34 +105,44 @@ def _patch_ini(fullscreen: bool = False):
     fullscreen=True when launching a game (fills stream with game content),
     False for the idle dashboard (windowed, avoids black screen on boot).
     """
-    INI_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        INI_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.error("Could not create %s: %s — skipping ini patch",
+                  INI_PATH.parent, exc)
+        return
 
     fs_val = "True" if fullscreen else "False"
 
     if not INI_PATH.exists():
-        INI_PATH.write_text(
-            "[General]\n"
-            "BackgroundInput = True\n"
-            "\n"
-            "[Core]\n"
-            "SIDevice0 = 6\n"
-            "SIDevice1 = 0\n"
-            "SIDevice2 = 0\n"
-            "SIDevice3 = 0\n"
-            "GFXBackend = OpenGL\n"
-            "CPUThread = False\n"
-            "\n"
-            "[Interface]\n"
-            "ConfirmStop = False\n"
-            "\n"
-            "[Display]\n"
-            "RenderToMain = False\n"
-            f"Fullscreen = {fs_val}\n"
-            "\n"
-            "[Analytics]\n"
-            "Enabled = False\n"
-            "PermissionAsked = True\n"
-        )
+        try:
+            INI_PATH.write_text(
+                "[General]\n"
+                "BackgroundInput = True\n"
+                "\n"
+                "[Core]\n"
+                "SIDevice0 = 6\n"
+                "SIDevice1 = 0\n"
+                "SIDevice2 = 0\n"
+                "SIDevice3 = 0\n"
+                "GFXBackend = OpenGL\n"
+                "CPUThread = False\n"
+                "\n"
+                "[Interface]\n"
+                "ConfirmStop = False\n"
+                "\n"
+                "[Display]\n"
+                "RenderToMain = False\n"
+                f"Fullscreen = {fs_val}\n"
+                "\n"
+                "[Analytics]\n"
+                "Enabled = False\n"
+                "PermissionAsked = True\n"
+            )
+        except OSError as exc:
+            log.error("Could not create %s: %s — broker defaults not applied",
+                      INI_PATH, exc)
+            return
         log.info("Created Dolphin.ini with broker defaults (fullscreen=%s)", fullscreen)
         return
 
@@ -163,14 +190,25 @@ def _patch_ini(fullscreen: bool = False):
             else:
                 new_lines.append(line)
 
-        # Append any keys that weren't found in the file.
+        # Insert missing keys under their existing section header; only create
+        # the section if the file doesn't have it at all. Blindly appending a
+        # second [section] block at EOF accumulates duplicate headers.
         for section, keys in target.items():
             missing = {k: v for k, v in keys.items() if k not in applied[section]}
-            if missing:
+            if not missing:
+                continue
+            header_idx = next(
+                (i for i, l in enumerate(new_lines) if l.strip() == f"[{section}]"),
+                None,
+            )
+            add_lines = [f"{k} = {v}" for k, v in missing.items()]
+            if header_idx is None:
                 new_lines.append(f"[{section}]")
-                for k, v in missing.items():
-                    new_lines.append(f"{k} = {v}")
-                    log.warning("Dolphin.ini: [%s] %s not found — appended", section, k)
+                new_lines.extend(add_lines)
+            else:
+                new_lines[header_idx + 1:header_idx + 1] = add_lines
+            for k in missing:
+                log.warning("Dolphin.ini: [%s] %s not found — inserted", section, k)
 
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
@@ -202,7 +240,10 @@ def _kill_dolphin():
         except subprocess.TimeoutExpired:
             log.warning("Dolphin did not exit after SIGTERM — sending SIGKILL")
             os.killpg(pgid, signal.SIGKILL)
-            proc.wait()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                log.error("Dolphin did not exit after SIGKILL — giving up")
     except ProcessLookupError:
         pass  # already gone
 
@@ -228,62 +269,45 @@ def _launch_dolphin_internal(rom_path):
     log.info("Launching Dolphin (rom=%s)", rom_path or "dashboard")
     log.debug("Launching: %s", " ".join(cmd))
 
+    # Append mode keeps history across launches. Failure to open is non-fatal:
+    # Dolphin still launches, just without captured output.
+    log_fh = None
+    try:
+        log_fh = open(DOLPHIN_LOG_PATH, "ab", buffering=0)
+        try:
+            os.chown(DOLPHIN_LOG_PATH, _LOG_UID, _LOG_GID)
+        except (OSError, PermissionError):
+            pass
+        log_fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} launch (rom={rom_path or 'dashboard'}) ===\n".encode())
+        log_fh.flush()
+    except OSError as exc:
+        log.warning("Cannot open %s for Dolphin output capture (%s); continuing without capture.", DOLPHIN_LOG_PATH, exc)
+
     try:
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=log_fh if log_fh else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if log_fh else subprocess.DEVNULL,
             preexec_fn=os.setpgrp,
         )
     except Exception as exc:
         log.error("Failed to launch Dolphin: %s", exc)
+        if log_fh:
+            log_fh.close()
         with _session_lock:
             _session["process"] = None
             _session["is_managed"] = False
         return
+    finally:
+        # Popen dup'd the fd; close our handle so it isn't leaked.
+        if log_fh:
+            log_fh.close()
 
     with _session_lock:
         _session["process"] = proc
         _session["is_managed"] = True
     log.info("Dolphin launched (PID %d)", proc.pid)
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
-    Thread(target=_log_dolphin_output, args=(proc,), daemon=True).start()
-    Thread(target=_diag_window, args=(proc.pid,), daemon=True).start()
-
-
-def _log_dolphin_output(proc):
-    """Log Dolphin stdout/stderr to the broker log for crash diagnosis."""
-    try:
-        for raw in proc.stdout:
-            line = raw.decode(errors="replace").rstrip()
-            if line:
-                log.info("[dolphin] %s", line)
-    except Exception:
-        pass
-
-
-def _diag_window(pid: int):
-    """After a short delay, check whether Dolphin has an X11 window via xdotool.
-
-    Uses classname search rather than --pid because proc.pid is the sudo wrapper,
-    not the actual dolphin-emu process, so --pid never finds the window.
-    """
-    time.sleep(4)
-    try:
-        out = subprocess.check_output(
-            ["sudo", "-u", "abc", "env",
-             f"DISPLAY={ENV['DISPLAY']}", f"HOME={ENV['HOME']}",
-             "xdotool", "search", "--classname", "dolphin-emu"],
-            text=True, timeout=10,
-        ).strip()
-        if out:
-            log.info("[diag] Dolphin has X11 window(s): %s", out)
-        else:
-            log.warning("[diag] Dolphin has NO X11 windows (sudo PID %d) — check Xwayland/rendering", pid)
-    except subprocess.CalledProcessError:
-        log.warning("[diag] xdotool found no X11 windows for Dolphin (sudo PID %d)", pid)
-    except Exception as exc:
-        log.warning("[diag] xdotool check failed: %s", exc)
 
 
 def _monitor_process(proc, start_time):
@@ -455,20 +479,91 @@ def _xdotool_key(wid: str, key: str) -> bool:
         return False
 
 
+def _sstate_dir() -> Path | None:
+    """Return Dolphin's StateSaves dir, honouring an SSTATE_DIR override."""
+    env = os.environ.get("SSTATE_DIR")
+    if env:
+        return Path(env)
+    for c in _SSTATE_DIR_CANDIDATES:
+        if c.is_dir():
+            return c
+    return None
+
+
+def _sstate_snapshot(state_dir: Path) -> dict:
+    """Return {Path: (size, mtime)} for every file currently in state_dir."""
+    snap = {}
+    try:
+        for p in state_dir.iterdir():
+            try:
+                st = p.stat()
+                snap[p] = (st.st_size, st.st_mtime)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return snap
+
+
+def _wait_for_sstate_write(state_dir: Path, before: dict, deadline: float) -> bool:
+    """Poll state_dir until a savestate write completes or deadline passes.
+
+    Detects new files and overwrites (mtime change), then waits for the size
+    to be stable for 0.5 s. Killing Dolphin on a fixed timer instead of write
+    confirmation truncates large states mid-flush.
+    """
+    STABLE_SECS = 0.5
+    POLL_SECS   = 0.1
+    target = last_size = stable_since = None
+
+    while time.monotonic() < deadline:
+        after = _sstate_snapshot(state_dir)
+        if target is None:
+            for p, (size, mtime) in after.items():
+                prev = before.get(p)
+                if prev is None or prev[1] != mtime:
+                    target, last_size, stable_since = p, size, time.monotonic()
+                    log.debug("Save: write detected — %s (%d bytes)", p.name, size)
+                    break
+        else:
+            cur = after.get(target)
+            if cur is None:
+                target = None
+            elif cur[0] != last_size:
+                last_size, stable_since = cur[0], time.monotonic()
+            elif time.monotonic() - stable_since >= STABLE_SECS:
+                log.info("Save: state write complete — %s (%d bytes)", target.name, last_size)
+                return True
+        time.sleep(POLL_SECS)
+    return False
+
+
 def _xdotool_save_state(slot: int) -> bool:
     """Save emulator state to slot (1–8) via Shift+F{slot}.
 
     Dolphin maps Shift+F1–Shift+F8 directly to save slots 1–8, so no slot
-    cycling is needed. Sends the key then waits SSTATE_WAIT seconds for the
-    write to complete before returning.
+    cycling is needed. Sends the key then polls StateSaves for the write to
+    complete (up to SSTATE_WAIT seconds) so a follow-up kill cannot land
+    mid-flush. Falls back to a fixed 3 s sleep if StateSaves can't be found.
     """
     wid = _xdotool_find_window()
     if wid is None:
         return False
+
+    state_dir = _sstate_dir()
+    before = _sstate_snapshot(state_dir) if state_dir else {}
+
     if not _xdotool_key(wid, f"shift+F{slot}"):
         return False
-    log.info("xdotool: shift+F%d sent to window %s — waiting %.1fs for write", slot, wid, SSTATE_WAIT)
-    time.sleep(SSTATE_WAIT)
+
+    if state_dir is None:
+        log.warning("Save: StateSaves dir not found — falling back to fixed 3.0s wait")
+        time.sleep(3.0)
+        return True
+
+    log.info("xdotool: shift+F%d sent to window %s — waiting for write (max %.1fs)", slot, wid, SSTATE_WAIT)
+    if not _wait_for_sstate_write(state_dir, before, time.monotonic() + SSTATE_WAIT):
+        log.warning("Save: state write not confirmed within %.1fs (key was sent)", SSTATE_WAIT)
     return True
 
 
@@ -504,11 +599,20 @@ _PACTL_CMD = [
 
 
 def _pactl(*args: str) -> subprocess.CompletedProcess:
-    """Run pactl as abc so it connects to abc's PulseAudio instance."""
-    return subprocess.run(
-        _PACTL_CMD + ["pactl"] + list(args),
-        capture_output=True, text=True, timeout=5,
-    )
+    """Run pactl as abc so it connects to abc's PulseAudio instance.
+
+    A hung or missing pactl is reported as a non-zero CompletedProcess (rather
+    than raising) so the /volume and /mute handlers return a 500 instead of
+    dropping the connection with an unhandled exception."""
+    cmd = _PACTL_CMD + ["pactl"] + list(args)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        log.error("pactl timed out: %s", " ".join(args))
+        return subprocess.CompletedProcess(cmd, 124, "", "pactl timed out")
+    except OSError as exc:
+        log.error("pactl failed to run: %s", exc)
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
 def _pactl_get_mute() -> bool | None:
@@ -555,7 +659,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
     def _read_body(self) -> dict:
         try:
-            length = min(int(self.headers.get("Content-Length", 0)), 64 * 1024)
+            length = max(0, min(int(self.headers.get("Content-Length", 0)), 64 * 1024))
         except ValueError:
             length = 0
         if length == 0:
@@ -763,6 +867,27 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
+    """Stop the HTTP listener, let any in-flight save finish, then kill Dolphin.
+    Triggered on SIGTERM/SIGINT — serve_forever()'s KeyboardInterrupt path does
+    not cover SIGTERM from s6/systemd, which previously hard-killed Dolphin
+    mid-savestate on container stop."""
+    log.info("Received signal %d — beginning graceful shutdown", signum)
+    Thread(target=server.shutdown, daemon=True).start()
+
+    deadline = time.monotonic() + max(SSTATE_WAIT, 5.0)
+    while time.monotonic() < deadline:
+        with _session_lock:
+            if not _session["save_in_progress"]:
+                break
+        time.sleep(0.2)
+    else:
+        log.warning("Shutdown: in-flight save did not complete within %.1fs — killing Dolphin anyway", SSTATE_WAIT)
+
+    _kill_dolphin()
+    log.info("Shutdown complete")
+
+
 def main():
     log.info("Broker starting — waiting 5s for desktop...")
     if not SECRET:
@@ -786,14 +911,23 @@ def main():
     # whenever no game is playing.  Game launches kill this instance first.
     Thread(target=_launch_dolphin, args=(None,), daemon=True).start()
 
-    server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
+    # ThreadingHTTPServer: /save-and-exit with wait=true runs xdotool plus the
+    # savestate write poll inline; a single-threaded server would stall /health
+    # and /status for the duration. Session state is lock-protected.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("ROM broker listening on port %d", PORT)
     if SECRET:
         log.info("Shared secret auth enabled")
 
+    def _handle(signum, _frame):
+        _graceful_shutdown(server, signum)
+
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
+
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
+    finally:
         server.server_close()
 
 
