@@ -1,8 +1,8 @@
 # dolphin-romm-integration-mod
 
-A [linuxserver Docker mod](https://www.linuxserver.io/blog/2019-09-14-customizing-our-containers) for [linuxserver/dolphin](https://docs.linuxserver.io/images/docker-dolphin/) that integrates [RomM](https://github.com/rommapp/romm) streaming support.
+A [linuxserver Docker mod](https://www.linuxserver.io/blog/2019-09-14-customizing-our-containers) for [linuxserver/dolphin](https://docs.linuxserver.io/images/docker-dolphin/) that adds [RomM](https://github.com/rommapp/romm) streaming support.
 
-The mod injects a lightweight HTTP broker that manages the Dolphin emulator lifecycle — launching games on demand, saving/loading state, controlling volume, and streaming the display back to the RomM player page via the container's built-in WebRTC stream.
+An HTTP broker runs inside the container and manages the Dolphin lifecycle: game launches, save/load state, volume control, and returning to dashboard when a session ends. The display streams back to the RomM player via the container's built-in WebRTC/selkies setup.
 
 ---
 
@@ -55,9 +55,6 @@ streaming:
       host: http://<dolphin-host>:3001
       label: Dolphin
     - platform: wii
-      host: http://<dolphin-host>:3001
-      label: Dolphin
-    - platform: wiiu
       host: http://<dolphin-host>:3001
       label: Dolphin
 ```
