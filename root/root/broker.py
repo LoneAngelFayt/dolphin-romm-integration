@@ -248,6 +248,17 @@ def _kill_dolphin():
         pass  # already gone
 
 
+def _wait_dolphin_gone(timeout: float = 5.0) -> None:
+    """Poll until no dolphin-emu process remains, so the new instance doesn't
+    race the old one for the X display and gamepad sockets."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if subprocess.run(["pgrep", "-x", "dolphin-emu"], capture_output=True).returncode != 0:
+            return
+        time.sleep(0.2)
+    log.warning("dolphin-emu still running after %.1fs — continuing anyway", timeout)
+
+
 def _launch_dolphin_internal(rom_path):
     """Launch dolphin-emu as abc via sudo+env."""
     cmd = [
@@ -372,13 +383,19 @@ def _cleanup_stale_sockets():
 
 def _launch_dolphin(rom_path):
     # Auto-save before killing the current game (covers both navigate-away and
-    # game-switching).  Skipped when no game is running or a save is already in
-    # progress (e.g. called from /save-and-exit which saves first then kills).
-    # Read and set save_in_progress atomically to avoid a TOCTOU race with a
-    # concurrent /save-and-exit request.
+    # game-switching).  Skipped when no game is running, when the emulator
+    # already died (crash-relaunch path — a keystroke to a dead process would
+    # just poll for a savestate write that never comes), or when a save is
+    # already in progress (e.g. called from /save-and-exit which saves first
+    # then kills).  Read and set save_in_progress atomically to avoid a TOCTOU
+    # race with a concurrent /save-and-exit request.
     with _session_lock:
         old_game = _session["rom_path"]
-        if old_game is not None and not _session["save_in_progress"]:
+        emulator_alive = (
+            _session["process"] is not None
+            and _session["process"].poll() is None
+        )
+        if old_game is not None and emulator_alive and not _session["save_in_progress"]:
             _session["save_in_progress"] = True
             do_autosave = True
         else:
@@ -398,11 +415,15 @@ def _launch_dolphin(rom_path):
 
     _kill_dolphin()
     _patch_ini(fullscreen=bool(rom_path))
-    time.sleep(2)
+    _wait_dolphin_gone()
     with _session_lock:
         _session["rom_path"] = rom_path
         _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
-        _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # started_at marks when a *game* session began; the idle dashboard has
+        # no session start.
+        _session["started_at"] = (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) if rom_path else None
+        )
     _launch_dolphin_internal(rom_path)
 
 
@@ -653,7 +674,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -672,6 +692,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
+        elif not self._check_secret():
+            # /health stays open for container healthchecks; all other GETs
+            # require the shared secret, matching POST/DELETE.
+            self._send_json(403, {"error": "forbidden"})
         elif self.path == "/status":
             with _session_lock:
                 active = (
@@ -857,13 +881,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         log.info("Soft reset: returning to dashboard")
         self._send_json(200, {"status": "resetting"})
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Broker-Secret")
-        self.end_headers()
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -895,10 +912,12 @@ def main():
     time.sleep(5)
 
     # Kill any stale Dolphin instance left from a previous broker run.
-    result = subprocess.run(["pkill", "-9", "-f", "/usr/games/dolphin-emu"], capture_output=True)
+    # -x matches the process name exactly; -f with a path substring would also
+    # match unrelated processes whose command line mentions the binary.
+    result = subprocess.run(["pkill", "-9", "-x", "dolphin-emu"], capture_output=True)
     if result.returncode == 0:
         log.info("Killed stale dolphin-emu instance(s) on startup.")
-        time.sleep(2)
+        _wait_dolphin_gone()
 
     _patch_ini()
 
