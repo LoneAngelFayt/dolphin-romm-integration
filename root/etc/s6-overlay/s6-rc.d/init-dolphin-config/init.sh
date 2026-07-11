@@ -66,6 +66,21 @@ if [ ! -f "$GCPAD_INI" ] && [ -f "/defaults/GCPadNew.ini" ]; then
     echo "[broker-mod] Copied default GCPadNew.ini (controller mappings)."
 fi
 
+# Seed the emulated Wiimote profile for Wii titles.  The base image ships no
+# WiimoteNew.ini, so Dolphin auto-generates a mouse/keyboard profile that is
+# useless over a stream.  This mod's /defaults/WiimoteNew.ini maps an emulated
+# Wiimote+Nunchuk to the SDL pad: Nunchuk stick on left stick, IR pointer on
+# right stick, Wiimote shake on B, Nunchuk shake on RB.  Replace the existing
+# file only while it has never been pointed at an SDL device, so a hand-tuned
+# profile survives restarts.
+WIIMOTE_INI="$DOLPHIN_CFG_DIR/WiimoteNew.ini"
+if [ -f "/defaults/WiimoteNew.ini" ]; then
+    if [ ! -f "$WIIMOTE_INI" ] || ! grep -q "Device = SDL/" "$WIIMOTE_INI"; then
+        cp /defaults/WiimoteNew.ini "$WIIMOTE_INI"
+        echo "[broker-mod] Seeded WiimoteNew.ini (emulated Wiimote+Nunchuk on SDL pad)."
+    fi
+fi
+
 # Log kernel input device names so we can verify GCPadNew.ini uses the right
 # SDL device name.  Without libudev.so.1.0.0-fake, SDL falls back to sysfs for
 # device names — these are the names it will see.
