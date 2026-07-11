@@ -51,8 +51,12 @@ ENV = {
     "HOME":               "/config",
     "USER":               "abc",
     # The joystick interposer hooks open() on /dev/input/* and redirects to
-    # selkies Unix sockets so controller input reaches Dolphin.
-    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
+    # selkies Unix sockets so controller input reaches Dolphin. The fake
+    # libudev is required alongside it: /dev/input is empty in the container,
+    # so SDL's udev enumeration finds no devices without it and Dolphin never
+    # opens the interposer's virtual pads.
+    "LD_PRELOAD": os.environ.get("LD_PRELOAD")
+    or "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
 }
 
 # Dolphin on this image writes all config files directly to
