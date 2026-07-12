@@ -29,6 +29,11 @@ if not (1 <= SAVE_SLOT <= 7):
 # Returns as soon as the file size is stable, so raising this only affects the
 # failure path. Falls back to a fixed 3 s sleep if the StateSaves dir is absent.
 SSTATE_WAIT   = float(os.environ.get("SSTATE_WAIT", "10.0"))
+# Resume-from-state (launch with load_slot): how long to wait for the game
+# window to appear, and how long to let the game settle before the deferred
+# slot load. Dolphin has no IPC status probe, so the settle is generous.
+RESUME_LOAD_WAIT   = float(os.environ.get("RESUME_LOAD_WAIT",   "90.0"))
+RESUME_LOAD_SETTLE = float(os.environ.get("RESUME_LOAD_SETTLE", "8.0"))
 
 # Dolphin writes savestates to StateSaves under its data dir; the location
 # varies by build (XDG vs. non-XDG layout), so both are probed at save time.
@@ -89,6 +94,9 @@ _session: dict = {
     "started_at":       None,
     "is_managed":       False,
     "save_in_progress": False,
+    # True from POST /launch until _launch_dolphin has swapped instances —
+    # gates the deferred resume load so it never fires at the old window.
+    "launch_in_progress": False,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -387,6 +395,14 @@ def _cleanup_stale_sockets():
 
 
 def _launch_dolphin(rom_path):
+    try:
+        _launch_dolphin_inner(rom_path)
+    finally:
+        with _session_lock:
+            _session["launch_in_progress"] = False
+
+
+def _launch_dolphin_inner(rom_path):
     # Auto-save before killing the current game (covers both navigate-away and
     # game-switching).  Skipped when no game is running, when the emulator
     # already died (crash-relaunch path — a keystroke to a dead process would
@@ -640,6 +656,27 @@ def _xdotool_load_state(slot: int) -> bool:
         return False
     log.info("xdotool: F%d sent to window %s", slot, wid)
     return True
+
+
+def _deferred_load_state(slot: int) -> None:
+    """Resume-from-state: send the load key once the launched game is up.
+
+    Waits for launch_in_progress to clear first — the old instance is dead and
+    gone by then, so any window found afterwards belongs to the new game. The
+    settle delay lets the game boot far enough to accept the hotkey.
+    """
+    deadline = time.monotonic() + RESUME_LOAD_WAIT
+    while time.monotonic() < deadline:
+        with _session_lock:
+            launching = _session["launch_in_progress"]
+            running = _session["rom_path"] is not None
+        if not launching and running and _xdotool_find_window() is not None:
+            time.sleep(RESUME_LOAD_SETTLE)
+            ok = _xdotool_load_state(slot)
+            log.info("resume: deferred load of slot %d %s", slot, "delivered" if ok else "failed")
+            return
+        time.sleep(1.0)
+    log.warning("resume: game window never appeared — slot %d not loaded", slot)
 
 
 def _save_and_exit(slot: int) -> bool:
@@ -1002,7 +1039,21 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
             return
 
+        # Resume-from-state: load this slot once the game window is up.
+        load_slot = body.get("load_slot")
+        if load_slot is not None and (
+            not isinstance(load_slot, int) or not (1 <= load_slot <= 8)
+        ):
+            self._send_json(400, {"error": "load_slot must be 1–8"})
+            return
+
+        with _session_lock:
+            _session["launch_in_progress"] = True
         Thread(target=_launch_dolphin, args=(str(rom_path),), daemon=True).start()
+        if load_slot is not None:
+            Thread(
+                target=_deferred_load_state, args=(load_slot,), daemon=True
+            ).start()
         self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
 
     def do_DELETE(self):
