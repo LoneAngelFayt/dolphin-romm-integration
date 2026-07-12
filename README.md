@@ -74,6 +74,8 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 | `POST` | `/save-and-exit` | Save to auto-save slot then stop game (`{"slot": 8, "wait": true}`) |
 | `POST` | `/save-state` | Save to a user slot in background (`{"slot": 1}`) |
 | `POST` | `/load-state` | Load from a slot (`{"slot": 1}`) |
+| `GET` | `/state-file?slot=N` | Newest state file for slot N as raw bytes; the filename is echoed in the `X-State-Filename` header. Blocks while a save is in flight (up to `STATE_GET_WAIT`) so a GET after `/save-state` carries the finished write. `slot=0` resolves to `SAVE_SLOT`; returns `404` if the slot has no state. |
+| `PUT` | `/state-file?filename=NAME` | Write raw body into StateSaves as `NAME` (used by RomM to hydrate a claimed container). `NAME` must be a bare `<GameID>.sNN` basename; write is atomic and chowned to `abc`. Max 256 MB. |
 | `POST` | `/volume` | Set PulseAudio volume (`{"level": 80}`) |
 | `POST` | `/mute` | Mute/unmute (`{"mute": true}` or `{}` to toggle) |
 | `POST` | `/cleanup` | Restart selkies to flush stale gamepad connections |
@@ -99,6 +101,7 @@ Dolphin supports 8 save state slots. **Slot 8 is reserved exclusively for auto-s
 | `BROKER_SECRET` | _(empty)_ | Shared secret for request auth (`X-Broker-Secret` header) |
 | `ROM_ROOT` | `/romm/library` | ROM files must be within this path |
 | `SSTATE_WAIT` | `3.0` | Seconds to wait after save key before killing Dolphin |
+| `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` blocks waiting for an in-flight save to finish |
 | `BROKER_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`) |
 
 ---
