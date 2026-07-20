@@ -637,6 +637,8 @@ def _xdotool_save_state(slot: int) -> bool:
     if wid is None:
         return False
 
+    _capture_state_screenshot(wid, slot)
+
     state_dir = _sstate_dir()
     before = _sstate_snapshot(state_dir) if state_dir else {}
 
@@ -883,6 +885,81 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
     return (written, skipped)
 
 
+# ── State screenshots ─────────────────────────────────────────────────────────
+# Dolphin savestates carry no embedded frame (unlike PCSX2's .p2s archives), so
+# the broker takes one itself: the screenshot hotkey fires just before the save
+# key and the PNG Dolphin drops in ScreenShots is filed under the slot, where
+# RomM picks it up as the state's thumbnail. Firing first keeps the "Saved State
+# to Slot N" banner out of the captured frame.
+#
+# Best effort throughout: a state without a thumbnail is fine, so no failure
+# here is allowed to fail the save.
+
+SCREENSHOT_WAIT = float(os.environ.get("SCREENSHOT_WAIT", "5.0"))
+SCREENSHOT_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _screenshot_dir() -> Path:
+    return (_save_data_root() or _SAVE_DATA_ROOTS[0]) / "ScreenShots"
+
+
+def _state_shot_path(slot: int) -> Path:
+    root = _save_data_root() or _SAVE_DATA_ROOTS[0]
+    return root / "romm" / "state-shots" / f"slot{slot:02d}.png"
+
+
+def _screenshot_snapshot(root: Path) -> set:
+    """Every PNG currently under the ScreenShots tree, one game dir per title."""
+    if not root.is_dir():
+        return set()
+    return {p for p in root.rglob("*.png") if p.is_file()}
+
+
+def _capture_state_screenshot(wid: str, slot: int) -> bool:
+    """Fire the screenshot hotkey and move the resulting PNG under the slot."""
+    root = _screenshot_dir()
+    before = _screenshot_snapshot(root)
+    if not _xdotool_key(wid, "F9"):
+        return False
+
+    shot = None
+    deadline = time.monotonic() + SCREENSHOT_WAIT
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        new = _screenshot_snapshot(root) - before
+        if new:
+            # Take the newest, in case the user fired their own F9 alongside.
+            shot = max(new, key=lambda p: p.stat().st_mtime)
+            break
+    if shot is None:
+        log.warning("screenshot: no PNG appeared within %.1fs", SCREENSHOT_WAIT)
+        return False
+
+    # The hotkey returns before the encode finishes, so wait for a stable size.
+    last = -1
+    while time.monotonic() < deadline:
+        try:
+            size = shot.stat().st_size
+        except OSError:
+            return False
+        if size > 0 and size == last:
+            break
+        last = size
+        time.sleep(0.2)
+
+    target = _state_shot_path(slot)
+    try:
+        _mkdirs_owned(target.parent)
+        # Dolphin wrote it, so this is a move within /config: the screenshot was
+        # taken for the state and is not one the player asked to keep.
+        os.replace(shot, target)
+    except OSError as exc:
+        log.warning("screenshot: could not file %s under slot %d: %s", shot, slot, exc)
+        return False
+    log.info("screenshot: slot %d thumbnail captured (%d bytes)", slot, last)
+    return True
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class BrokerHandler(BaseHTTPRequestHandler):
@@ -954,6 +1031,39 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
         log.info("state-file: served %s (%d bytes)", state_path.name, len(content))
+
+    def _get_state_screenshot(self):
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            slot = int(query.get("slot", ["0"])[0])
+        except ValueError:
+            self._send_json(400, {"error": "slot must be an integer"})
+            return
+        if slot == 0:
+            slot = SAVE_SLOT
+        if not (1 <= slot <= AUTOSAVE_SLOT):
+            self._send_json(400, {"error": f"slot must be 0–{AUTOSAVE_SLOT}"})
+            return
+
+        # A save in flight is about to overwrite this slot's thumbnail; wait it
+        # out so the caller never pairs a new state with the previous frame.
+        _wait_for_save_idle(time.monotonic() + STATE_GET_WAIT)
+
+        path = _state_shot_path(slot)
+        try:
+            content = path.read_bytes()
+        except OSError:
+            self._send_json(404, {"error": "no screenshot for slot", "slot": slot})
+            return
+        if not content or len(content) > SCREENSHOT_MAX_BYTES:
+            self._send_json(413, {"error": "screenshot exceeds size limit"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+        log.info("state-screenshot: served slot %d (%d bytes)", slot, len(content))
 
     def _get_save_file(self):
         with _session_lock:
@@ -1069,6 +1179,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._get_state_file()
         elif urlparse(self.path).path == "/save-file":
             self._get_save_file()
+        elif urlparse(self.path).path == "/state-screenshot":
+            self._get_state_screenshot()
         elif self.path == "/status":
             with _session_lock:
                 active = (

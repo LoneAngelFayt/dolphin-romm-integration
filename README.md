@@ -76,9 +76,18 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 | `POST` | `/load-state` | Load from a slot (`{"slot": 1}`) |
 | `GET` | `/state-file?slot=N` | Newest state file for slot N as raw bytes; the filename is echoed in the `X-State-Filename` header. Blocks while a save is in flight (up to `STATE_GET_WAIT`) so a GET after `/save-state` carries the finished write. `slot=0` resolves to `SAVE_SLOT`; returns `404` if the slot has no state. |
 | `PUT` | `/state-file?filename=NAME` | Write raw body into StateSaves as `NAME` (used by RomM to hydrate a claimed container). `NAME` must be a bare `<GameID>.sNN` basename; write is atomic and chowned to `abc`. Max 256 MB. |
+| `GET` | `/state-screenshot?slot=N` | PNG frame captured at the moment slot N was saved, used by RomM as the state's thumbnail. `404` if the slot has no capture. |
 | `POST` | `/volume` | Set PulseAudio volume (`{"level": 80}`) |
 | `POST` | `/mute` | Mute/unmute (`{"mute": true}` or `{}` to toggle) |
 | `POST` | `/cleanup` | Restart selkies to flush stale gamepad connections |
+
+### State Screenshots
+
+Dolphin savestates carry no embedded frame, so the broker takes one: the
+screenshot hotkey (`F9`) fires just before the save key and the PNG Dolphin
+writes to `ScreenShots` is filed under the slot for `GET /state-screenshot`.
+Firing before the save keeps the "Saved State to Slot N" banner out of the
+frame. It is best effort throughout: a failed capture never fails the save.
 
 ### Save State Slots
 
@@ -104,6 +113,7 @@ Dolphin supports 8 save state slots. **Slot 8 is reserved exclusively for auto-s
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` blocks waiting for an in-flight save to finish |
 | `RESUME_LOAD_WAIT` | `90.0` | Max seconds a `load_slot` launch waits for the new game window before giving up on the deferred state load |
 | `RESUME_LOAD_SETTLE` | `8.0` | Seconds to let the game boot after its window appears, before the deferred `load_slot` hotkey fires |
+| `SCREENSHOT_WAIT` | `5.0` | Max seconds to wait for the screenshot hotkey to produce a PNG before giving up on the state thumbnail |
 | `BROKER_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`) |
 
 ---
