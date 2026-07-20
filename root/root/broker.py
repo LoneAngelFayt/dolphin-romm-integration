@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import signal
 import socket as _socket
 import subprocess
@@ -43,6 +44,9 @@ _SSTATE_DIR_CANDIDATES = (
     Path("/config/.local/share/dolphin-emu/StateSaves"),
     Path("/config/.config/dolphin-emu/StateSaves"),
 )
+
+# Dolphin's EXIDeviceType for a GCI folder card (Source/Core/Core/HW/EXI/EXI_Device.h).
+EXI_MEMORY_CARD_FOLDER = 8
 
 ENV = {
     "DISPLAY":            ":0",
@@ -132,6 +136,7 @@ def _patch_ini(fullscreen: bool = False):
         return
 
     fs_val = "True" if fullscreen else "False"
+    card_dir = str(_gci_card_path())
 
     if not INI_PATH.exists():
         try:
@@ -146,6 +151,8 @@ def _patch_ini(fullscreen: bool = False):
                 "SIDevice3 = 0\n"
                 "GFXBackend = OpenGL\n"
                 "CPUThread = False\n"
+                f"SlotA = {EXI_MEMORY_CARD_FOLDER}\n"
+                f"GCIFolderAPathOverride = {card_dir}\n"
                 "\n"
                 "[Interface]\n"
                 "ConfirmStop = False\n"
@@ -176,6 +183,8 @@ def _patch_ini(fullscreen: bool = False):
             "SIDevice3": "0",
             "GFXBackend": "OpenGL",
             "CPUThread": "False",
+            "SlotA": str(EXI_MEMORY_CARD_FOLDER),
+            "GCIFolderAPathOverride": card_dir,
         },
         "Interface": {"ConfirmStop": "False"},
         "Display": {"RenderToMain": "False", "Fullscreen": fs_val},
@@ -755,7 +764,10 @@ _SAVE_DATA_ROOTS = (
 )
 # Archive members must live under one of these root-relative subtrees; PUT
 # rejects anything else so a crafted zip cannot reach configs, keys or states.
-SAVE_SYNC_SUBTREES = ("GC", "Wii/title")
+# The Slot-A card is listed so GameCube saves still round-trip on a container
+# that has not opted in to whole-card sync; RomM skips /save-file entirely on
+# one that has, so the two paths never both carry the card.
+SAVE_SYNC_SUBTREES = ("GC", "Wii/title", "romm/Card A")
 SAVE_FILE_MAX_BYTES = 256 * 1024 * 1024
 # Zip stores mtimes at 2 s DOS resolution; the slack keeps the newer-file
 # guard from skipping files over rounding alone.
@@ -960,6 +972,120 @@ def _capture_state_screenshot(wid: str, slot: int) -> bool:
     return True
 
 
+# ── Memory cards ──────────────────────────────────────────────────────────────
+# RomM syncs the GameCube Slot-A card as one whole image, so a user's card can be
+# hydrated onto any pooled container. GET evacuates the card, PUT wipes it and
+# lays the pulled one back down. Slot B is never touched.
+#
+# Dolphin's default GCI folder sits under a region directory it picks from the
+# booted game (GC/USA/Card A), which the broker cannot know before launch. Slot A
+# is therefore pinned to GCIFolderAPathOverride, which Dolphin uses verbatim with
+# no region or card-name parts appended, giving one stable card dir per container.
+
+
+def _gci_card_path() -> Path:
+    """Absolute path to the Slot-A GCI folder card, existence-independent."""
+    env = os.environ.get("GCI_CARD_DIR")
+    if env:
+        return Path(env)
+    return (_save_data_root() or _SAVE_DATA_ROOTS[0]) / "romm" / "Card A"
+
+
+def _build_memory_card_archive() -> bytes | None | str:
+    """Zip the whole Slot-A card, member paths relative to the card root so the
+    image is path independent. Returns the zip bytes, None when the card dir does
+    not exist yet, or an error string when it is not a directory."""
+    path = _gci_card_path()
+    if path.exists() and not path.is_dir():
+        return "slot A card path is a file; a GCI folder is required"
+    if not path.is_dir():
+        return None
+    files = [p for p in sorted(path.rglob("*")) if p.is_file() and not p.is_symlink()]
+    total = 0
+    for p in files:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            continue
+    if total > SAVE_FILE_MAX_BYTES:
+        log.warning("memory-card: card exceeds size limit (%d bytes)", total)
+        return "memory card exceeds size limit"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in files:
+            try:
+                zf.write(p, p.relative_to(path).as_posix())
+            except OSError as exc:
+                log.warning("memory-card: could not read %s: %s", p, exc)
+    return buf.getvalue()
+
+
+def _replace_memory_card(content: bytes) -> tuple[int] | str:
+    """Wipe the Slot-A card and lay down the pulled card image. Returns
+    (written,) on success or an error string. The whole card is replaced (no
+    per-file mtime merge): this is the hydrate-with-isolation guarantee for
+    pooled containers. Extraction goes to a staging dir that is swapped over the
+    live card, so a mid-way failure never leaves a half-wiped card."""
+    path = _gci_card_path()
+    if path.exists() and not path.is_dir():
+        log.warning("memory-card: hydrate rejected, slot A path is a file at %s", path)
+        return "slot A card path is a file; a GCI folder is required"
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        return "body is not a zip archive"
+    with zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
+            return "archive exceeds size limit when extracted"
+        for info in infos:
+            member = PurePosixPath(info.filename)
+            if member.is_absolute() or ".." in member.parts:
+                return f"archive member escapes card dir: {info.filename}"
+
+        parent = path.parent
+        staging = parent / f".{path.name}.new-{os.getpid()}"
+        backup = parent / f".{path.name}.old-{os.getpid()}"
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            _mkdirs_owned(staging)
+            written = 0
+            for info in infos:
+                target = staging / PurePosixPath(info.filename)
+                _mkdirs_owned(target.parent)
+                tmp = target.parent / f".{target.name}.tmp"
+                tmp.write_bytes(zf.read(info))
+                os.chown(tmp, _LOG_UID, _LOG_GID)
+                os.replace(tmp, target)
+                written += 1
+            # Swap staging over the live card: move the old card aside, move the
+            # new one into place, then drop the old. Both live under the same
+            # parent, so the renames are atomic same-filesystem operations.
+            if path.exists():
+                os.replace(path, backup)
+            os.replace(staging, path)
+        except OSError as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            # If we moved the old card aside but never put the new one in place,
+            # restore it so a mid-swap failure never leaves the user cardless.
+            if not path.exists() and backup.exists():
+                try:
+                    os.replace(backup, path)
+                except OSError:
+                    # The backup is now the only surviving copy of the card,
+                    # leave it on disk for manual recovery instead of deleting it.
+                    log.error(
+                        "memory-card: could not restore card to %s, old card preserved at %s",
+                        path,
+                        backup,
+                    )
+                    return f"could not write memory card: {exc}"
+            shutil.rmtree(backup, ignore_errors=True)
+            return f"could not write memory card: {exc}"
+        shutil.rmtree(backup, ignore_errors=True)
+    return (written,)
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class BrokerHandler(BaseHTTPRequestHandler):
@@ -975,11 +1101,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
             SECRET,
         )
 
-    def _send_json(self, code: int, body: dict) -> None:
+    def _send_json(self, code: int, body: dict, headers: dict | None = None) -> None:
         payload = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1108,6 +1236,52 @@ class BrokerHandler(BaseHTTPRequestHandler):
         log.info("save-file: restored archive — %d written, %d skipped", written, skipped)
         self._send_json(200, {"status": "ok", "written": written, "skipped": skipped})
 
+    def _get_memory_card(self):
+        result = _build_memory_card_archive()
+        if isinstance(result, str):
+            self._send_json(409, {"error": result})
+            return
+        if result is None:
+            # Tag the "no card yet" 404 so the backend can tell a genuinely
+            # empty card apart from a missing endpoint (an unmarked 404), which
+            # must NOT be treated as safe-to-wipe.
+            self._send_json(
+                404,
+                {"error": "no folder memory card in slot A"},
+                headers={"X-Memory-Card": "absent"},
+            )
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(result)))
+        self.send_header("X-Memory-Card-Slot", "A")
+        self.end_headers()
+        self.wfile.write(result)
+        log.info("memory-card: served slot-A card (%d bytes)", len(result))
+
+    def _put_memory_card(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._send_json(400, {"error": "missing or empty body"})
+            return
+        if length > SAVE_FILE_MAX_BYTES:
+            self._send_json(413, {"error": "archive too large"})
+            return
+        content = self.rfile.read(length)
+        if len(content) != length:
+            self._send_json(400, {"error": "truncated request body"})
+            return
+        result = _replace_memory_card(content)
+        if isinstance(result, str):
+            self._send_json(400, {"error": result})
+            return
+        (written,) = result
+        log.info("memory-card: replaced slot-A card — %d files", written)
+        self._send_json(200, {"status": "ok", "written": written})
+
     def do_PUT(self):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
@@ -1115,6 +1289,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/save-file":
             self._put_save_file()
+            return
+        if parsed.path == "/memory-card":
+            self._put_memory_card()
             return
         if parsed.path != "/state-file":
             self._send_json(404, {"error": "not found"})
@@ -1179,6 +1356,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._get_state_file()
         elif urlparse(self.path).path == "/save-file":
             self._get_save_file()
+        elif urlparse(self.path).path == "/memory-card":
+            self._get_memory_card()
         elif urlparse(self.path).path == "/state-screenshot":
             self._get_state_screenshot()
         elif self.path == "/status":

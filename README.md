@@ -54,6 +54,7 @@ streaming:
     - platform: ngc
       host: http://<dolphin-host>:3001
       label: Dolphin
+      memory_card_sync: true
     - platform: wii
       host: http://<dolphin-host>:3001
       label: Dolphin
@@ -77,9 +78,28 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 | `GET` | `/state-file?slot=N` | Newest state file for slot N as raw bytes; the filename is echoed in the `X-State-Filename` header. Blocks while a save is in flight (up to `STATE_GET_WAIT`) so a GET after `/save-state` carries the finished write. `slot=0` resolves to `SAVE_SLOT`; returns `404` if the slot has no state. |
 | `PUT` | `/state-file?filename=NAME` | Write raw body into StateSaves as `NAME` (used by RomM to hydrate a claimed container). `NAME` must be a bare `<GameID>.sNN` basename; write is atomic and chowned to `abc`. Max 256 MB. |
 | `GET` | `/state-screenshot?slot=N` | PNG frame captured at the moment slot N was saved, used by RomM as the state's thumbnail. `404` if the slot has no capture. |
+| `GET` | `/save-file` | Zip of every in-game save (GC cards, Wii NAND titles) modified since the last game launch; `404` when nothing changed. |
+| `PUT` | `/save-file` | Restore a pulled save archive. Files newer in the container than in the archive are skipped. Max 256 MB. |
+| `GET` | `/memory-card` | Zip of the whole Slot-A GCI folder card, member paths relative to the card root. `404` with `X-Memory-Card: absent` when no card exists yet. |
+| `PUT` | `/memory-card` | Wipe Slot A and lay down the card in the body. Staged then swapped, so a failure never leaves a half-wiped card. Max 256 MB. |
 | `POST` | `/volume` | Set PulseAudio volume (`{"level": 80}`) |
 | `POST` | `/mute` | Mute/unmute (`{"mute": true}` or `{}` to toggle) |
 | `POST` | `/cleanup` | Restart selkies to flush stale gamepad connections |
+
+### Memory Cards
+
+Slot A is pinned to a GCI **folder** card at a fixed path (`GCIFolderAPathOverride`
+in `Dolphin.ini`), which the broker sets on every launch. Dolphin's default GCI
+folder sits under a region directory it picks from the booted game
+(`GC/USA/Card A`), which the broker cannot know before launch; the override is
+used verbatim, with no region or card-name parts appended, so there is one
+stable card directory per container.
+
+That is what lets RomM treat the card as a single per-user image: `GET
+/memory-card` evacuates it at release, `PUT /memory-card` lays the next user's
+card down at claim. Slot B is never touched. Enable it per platform in RomM
+with `memory_card_sync: true` on the `ngc` container entry (Wii saves live in
+NAND, not on a card, so the `wii` entry keeps the `/save-file` path).
 
 ### State Screenshots
 
@@ -114,6 +134,7 @@ Dolphin supports 8 save state slots. **Slot 8 is reserved exclusively for auto-s
 | `RESUME_LOAD_WAIT` | `90.0` | Max seconds a `load_slot` launch waits for the new game window before giving up on the deferred state load |
 | `RESUME_LOAD_SETTLE` | `8.0` | Seconds to let the game boot after its window appears, before the deferred `load_slot` hotkey fires |
 | `SCREENSHOT_WAIT` | `5.0` | Max seconds to wait for the screenshot hotkey to produce a PNG before giving up on the state thumbnail |
+| `GCI_CARD_DIR` | _(derived)_ | Slot-A GCI folder card path; defaults to `romm/Card A` under Dolphin's data dir |
 | `BROKER_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`) |
 
 ---
