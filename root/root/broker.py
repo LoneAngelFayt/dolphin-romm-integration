@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""broker.py — launch Dolphin on demand and expose a small HTTP API."""
+"""broker.py: launch Dolphin on demand and expose a small HTTP API."""
 
 import glob
 import hmac
@@ -24,26 +24,37 @@ from urllib.parse import parse_qs, urlparse
 PORT       = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET     = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
-MAX_SLOT      = 8                                       # Dolphin maps F1–F8 / Shift+F1–F8 to slots 1–8
-# Every state write — manual save, save-and-exit, auto-save on navigate-away —
+MAX_SLOT      = 8                                       # Dolphin maps F1-F8 / Shift+F1-F8 to slots 1-8
+# Every state write (manual save, save-and-exit, auto-save on navigate-away)
 # goes through this one slot, and every read defaults to it. RomM does not
 # offer slot selection, so a second "autosave" slot would only split the
 # library's view of a session across two files. Overridable for debugging.
 SAVE_SLOT     = int(os.environ.get("SAVE_SLOT", str(MAX_SLOT)))
-AUTOSAVE_SLOT = SAVE_SLOT                               # kept as an alias for /config consumers
+AUTOSAVE_SLOT = SAVE_SLOT                               # /status reports both names
 if not (1 <= SAVE_SLOT <= MAX_SLOT):
-    raise SystemExit(f"SAVE_SLOT must be 1–{MAX_SLOT}, got {SAVE_SLOT}")
+    raise SystemExit(f"SAVE_SLOT must be 1-{MAX_SLOT}, got {SAVE_SLOT}")
 # Max seconds to poll for the savestate write to complete after the save key.
 # Returns as soon as the file size is stable, so raising this only affects the
 # failure path. Falls back to a fixed 3 s sleep if the StateSaves dir is absent.
 SSTATE_WAIT   = float(os.environ.get("SSTATE_WAIT", "10.0"))
 
-# Dolphin writes savestates to StateSaves under its data dir; the location
-# varies by build (XDG vs. non-XDG layout), so both are probed at save time.
-_SSTATE_DIR_CANDIDATES = (
-    Path("/config/.local/share/dolphin-emu/StateSaves"),
-    Path("/config/.config/dolphin-emu/StateSaves"),
+# Dashboard crash-relaunch policy. A Dolphin that survives longer than the
+# healthy threshold clears the failure count; anything shorter is treated as a
+# crash loop and backed off, then abandoned.
+RELAUNCH_HEALTHY_SECONDS = 5.0
+RELAUNCH_BACKOFF_BASE    = 5
+RELAUNCH_BACKOFF_CAP     = 60
+RELAUNCH_MAX_FAILURES    = 5
+
+# Dolphin's data dir; the location varies by build (XDG vs. non-XDG layout), so
+# both are probed at use time. Savestates, screenshots and the memory card all
+# hang off this one root: probing for each independently let a state resolve
+# under one candidate while its thumbnail resolved under the other.
+_SAVE_DATA_ROOTS = (
+    Path("/config/.local/share/dolphin-emu"),
+    Path("/config/.config/dolphin-emu"),
 )
+_SSTATE_DIR_CANDIDATES = tuple(r / "StateSaves" for r in _SAVE_DATA_ROOTS)
 
 # Dolphin's EXIDeviceType for a GCI folder card (Source/Core/Core/HW/EXI/EXI_Device.h).
 EXI_MEMORY_CARD_FOLDER = 8
@@ -54,7 +65,7 @@ ENV = {
     # creates a VK_KHR_wayland_surface and renders directly to the Wayland
     # compositor, leaving the X11 window black.  Without it, Vulkan uses
     # VK_KHR_xcb_surface and renders into the X11 window that Xwayland
-    # composites into labwc — which is what selkies captures.
+    # composites into labwc, which is what selkies captures.
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "QT_QPA_PLATFORM":    "xcb",
     "PULSE_RUNTIME_PATH": "/defaults",
@@ -72,7 +83,7 @@ ENV = {
 }
 
 # Dolphin on this image writes all config files directly to
-# ~/.config/dolphin-emu/ — there is no Config/ subdirectory.
+# ~/.config/dolphin-emu/. There is no Config/ subdirectory.
 INI_PATH = Path("/config/.config/dolphin-emu/Dolphin.ini")
 
 # Dolphin's stdout/stderr is redirected at fd level to this file. A Python
@@ -93,6 +104,13 @@ log = logging.getLogger("broker")
 # ── Session state ─────────────────────────────────────────────────────────────
 
 _session_lock = Lock()
+# Serialises whole launch sequences. _session_lock only guards the dict; two
+# concurrent /launch requests used to interleave their kill/patch/spawn steps
+# and leave two Dolphins running, or none.
+_launch_lock = Lock()
+# Serialises card hydration. The staging and backup dirs were named after the
+# pid, which is the same pid for every thread of this server.
+_memory_card_lock = Lock()
 _session: dict = {
     "process":          None,
     "rom_path":         None,
@@ -100,13 +118,12 @@ _session: dict = {
     "started_at":       None,
     "is_managed":       False,
     "save_in_progress": False,
-    # True from POST /launch until _launch_dolphin has swapped instances —
-    # gates the deferred resume load so it never fires at the old window.
-    "launch_in_progress": False,
     # Wall-clock stamp of the last GAME launch (not dashboard relaunches).
     # GET /save-file only ships files modified at or after this point; it
     # survives game exit so RomM can still pull after the session ends.
     "save_baseline": None,
+    # Consecutive short-lived dashboard exits; see _monitor_process.
+    "relaunch_failures": 0,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -126,7 +143,7 @@ def _chown_abc(path: Path):
     """Hand a broker-written file back to abc.
 
     The broker runs as root, so anything it writes lands root-owned and
-    Dolphin (running as abc) can read but never rewrite it — every setting
+    Dolphin (running as abc) can read but never rewrite it, so every setting
     Dolphin tries to persist is then silently dropped.
     """
     try:
@@ -144,7 +161,7 @@ def _patch_ini(fullscreen: bool = False):
     try:
         INI_PATH.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        log.error("Could not create %s: %s — skipping ini patch",
+        log.error("Could not create %s: %s, skipping ini patch",
                   INI_PATH.parent, exc)
         return
 
@@ -182,7 +199,7 @@ def _patch_ini(fullscreen: bool = False):
                 "PermissionAsked = True\n"
             )
         except OSError as exc:
-            log.error("Could not create %s: %s — broker defaults not applied",
+            log.error("Could not create %s: %s, broker defaults not applied",
                       INI_PATH, exc)
             return
         _chown_abc(INI_PATH)
@@ -191,7 +208,7 @@ def _patch_ini(fullscreen: bool = False):
 
     # Both keys below feed Core::UpdateInputGate, which drives the single
     # global ControlReference input gate. When that gate is shut every
-    # ControlReference reads 0 — hotkeys, GC pads and Wiimotes alike — so a
+    # ControlReference reads 0 (hotkeys, GC pads and Wiimotes alike), so a
     # wrong value here kills xdotool and browser gamepad input together.
     #
     # Section names are Dolphin's, not ours, and the two differ:
@@ -258,7 +275,7 @@ def _patch_ini(fullscreen: bool = False):
             if not missing:
                 continue
             header_idx = next(
-                (i for i, l in enumerate(new_lines) if l.strip() == f"[{section}]"),
+                (i for i, line in enumerate(new_lines) if line.strip() == f"[{section}]"),
                 None,
             )
             add_lines = [f"{k} = {v}" for k, v in missing.items()]
@@ -268,15 +285,23 @@ def _patch_ini(fullscreen: bool = False):
             else:
                 new_lines[header_idx + 1:header_idx + 1] = add_lines
             for k in missing:
-                log.warning("Dolphin.ini: [%s] %s not found — inserted", section, k)
+                log.warning("Dolphin.ini: [%s] %s not found, inserted", section, k)
 
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(INI_PATH)
         _chown_abc(INI_PATH)
-        log.debug("Dolphin.ini patched (ConfirmStop)")
-    except Exception as exc:
+        log.debug("Dolphin.ini patched")
+    except (OSError, UnicodeDecodeError) as exc:
+        # Only I/O and a non-text ini are expected to fail here (read-only
+        # /config, disk full, a half-written file from a previous crash).
+        # Anything else is a bug in the patcher and should surface as a
+        # traceback rather than be logged and shrugged off.
         log.error("Failed to patch Dolphin.ini: %s", exc)
+        try:
+            INI_PATH.with_suffix(".tmp").unlink()
+        except OSError:
+            pass
 
 
 def _kill_dolphin():
@@ -299,12 +324,12 @@ def _kill_dolphin():
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            log.warning("Dolphin did not exit after SIGTERM — sending SIGKILL")
+            log.warning("Dolphin did not exit after SIGTERM: sending SIGKILL")
             os.killpg(pgid, signal.SIGKILL)
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                log.error("Dolphin did not exit after SIGKILL — giving up")
+                log.error("Dolphin did not exit after SIGKILL: giving up")
     except ProcessLookupError:
         pass  # already gone
 
@@ -317,10 +342,32 @@ def _wait_dolphin_gone(timeout: float = 5.0) -> None:
         if subprocess.run(["pgrep", "-x", "dolphin-emu"], capture_output=True).returncode != 0:
             return
         time.sleep(0.2)
-    log.warning("dolphin-emu still running after %.1fs — continuing anyway", timeout)
+    log.warning("dolphin-emu still running after %.1fs, continuing anyway", timeout)
 
 
-def _launch_dolphin_internal(rom_path, state_path=None):
+DISPLAY_WAIT = float(os.environ.get("DISPLAY_WAIT", "30.0"))
+
+
+def _wait_for_display(timeout: float = DISPLAY_WAIT) -> bool:
+    """Block until the X server's socket exists, or the timeout expires.
+
+    Replaces a flat 5 s sleep: on a cold container the desktop is often not up
+    yet at 5 s (so the first Dolphin launch failed silently), and on a warm one
+    the sleep was 5 s of dead time before the broker would answer /health.
+    """
+    sock = Path(f"/tmp/.X11-unix/X{ENV['DISPLAY'].lstrip(':').split('.')[0]}")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if sock.exists():
+            log.info("Display %s is up", ENV["DISPLAY"])
+            return True
+        time.sleep(0.25)
+    log.warning("Display %s did not appear within %.0fs, starting anyway",
+                ENV["DISPLAY"], timeout)
+    return False
+
+
+def _spawn_dolphin(rom_path, state_path=None):
     """Launch dolphin-emu as abc via sudo+env."""
     cmd = [
         "sudo", "-u", "abc", "env",
@@ -335,7 +382,7 @@ def _launch_dolphin_internal(rom_path, state_path=None):
         # loop, which is where SDL joystick polling happens.  Without the event
         # loop, controller input never reaches the running game.  Without
         # --batch, when emulation stops Dolphin returns to its main menu rather
-        # than exiting — this is the desired idle behaviour.
+        # than exiting, which is the desired idle behaviour.
         cmd.append(f"--exec={rom_path}")
 
         # Resume-from-state is done at boot, not by a deferred hotkey. Dolphin
@@ -402,13 +449,33 @@ def _monitor_process(proc, start_time):
     if not should_relaunch:
         return
 
-    wait_time = 5 if duration < 5 else 1
-    log.info("Dolphin exited after %.1fs — relaunching dashboard in %ds", duration, wait_time)
+    # A dashboard that dies immediately dies again on relaunch, so back off and
+    # eventually stop: an uncapped loop respawned a broken Dolphin forever and
+    # buried the reason under thousands of identical log lines.
+    if duration >= RELAUNCH_HEALTHY_SECONDS:
+        failures = 0
+        wait_time = 1
+    else:
+        with _session_lock:
+            failures = _session["relaunch_failures"] + 1
+        if failures > RELAUNCH_MAX_FAILURES:
+            log.error(
+                "Dolphin exited after %.1fs on %d consecutive relaunches, giving up",
+                duration, failures - 1,
+            )
+            with _session_lock:
+                _session["is_managed"] = False
+                _session["relaunch_failures"] = 0
+            return
+        wait_time = min(RELAUNCH_BACKOFF_CAP, RELAUNCH_BACKOFF_BASE * 2 ** (failures - 1))
+
+    log.info("Dolphin exited after %.1fs, relaunching dashboard in %ds", duration, wait_time)
     time.sleep(wait_time)
 
     with _session_lock:
         if not _session["is_managed"]:
             return
+        _session["relaunch_failures"] = failures
 
     _launch_dolphin(None)
 
@@ -416,7 +483,7 @@ def _monitor_process(proc, start_time):
 def _cleanup_stale_sockets():
     """Remove only stale/unreachable selkies socket files.
 
-    Does NOT send EOF — sending EOF disconnects the browser gamepad client,
+    Does NOT send EOF: sending EOF disconnects the browser gamepad client,
     which breaks input for the new Dolphin instance. The interposer will
     reconnect to existing sockets automatically; we only clean up sockets
     that have become orphaned (no listener on the other end).
@@ -452,17 +519,14 @@ def _cleanup_stale_sockets():
 
 
 def _launch_dolphin(rom_path, state_path=None):
-    try:
-        _launch_dolphin_inner(rom_path, state_path)
-    finally:
-        with _session_lock:
-            _session["launch_in_progress"] = False
+    with _launch_lock:
+        _launch_dolphin_locked(rom_path, state_path)
 
 
-def _launch_dolphin_inner(rom_path, state_path=None):
+def _launch_dolphin_locked(rom_path, state_path=None):
     # Auto-save before killing the current game (covers both navigate-away and
     # game-switching).  Skipped when no game is running, when the emulator
-    # already died (crash-relaunch path — a keystroke to a dead process would
+    # already died (crash-relaunch path, where a keystroke to a dead process would
     # just poll for a savestate write that never comes), or when a save is
     # already in progress (e.g. called from /save-and-exit which saves first
     # then kills).  Read and set save_in_progress atomically to avoid a TOCTOU
@@ -486,7 +550,7 @@ def _launch_dolphin_inner(rom_path, state_path=None):
                 log.info("auto-save: saved to slot %d before leaving %s",
                          SAVE_SLOT, Path(old_game).name)
             else:
-                log.warning("auto-save: xdotool failed for slot %d — continuing anyway", SAVE_SLOT)
+                log.warning("auto-save: xdotool failed for slot %d, continuing anyway", SAVE_SLOT)
         finally:
             with _session_lock:
                 _session["save_in_progress"] = False
@@ -506,7 +570,7 @@ def _launch_dolphin_inner(rom_path, state_path=None):
         # save pull still sees the files the last game wrote.
         if rom_path:
             _session["save_baseline"] = time.time()
-    _launch_dolphin_internal(rom_path, state_path)
+    _spawn_dolphin(rom_path, state_path)
 
 
 # ── xdotool helpers ───────────────────────────────────────────────────────────
@@ -541,6 +605,9 @@ def _xdotool_find_window() -> str | None:
                 xdo_base + ["search", "--onlyvisible", "--pid", pid],
                 text=True, timeout=5,
             )
+            # Last, not first: xdotool lists in creation order and Dolphin's
+            # render window is created after the main window it replaces, so the
+            # newest ID is the one that actually has keyboard focus.
             ids = out.strip().split()
             if ids:
                 wid = ids[-1]
@@ -590,7 +657,11 @@ def _sstate_dir() -> Path | None:
     for c in _SSTATE_DIR_CANDIDATES:
         if c.is_dir():
             return c
-    return None
+    # Dolphin has not written a state yet. Derive the dir from the same root
+    # the screenshots and memory card resolve against, so a PUT that arrives
+    # before the first save still lands where the next save will look.
+    root = _save_data_root()
+    return root / "StateSaves" if root else None
 
 
 def _sstate_snapshot(state_dir: Path) -> dict:
@@ -634,7 +705,7 @@ def _wait_for_sstate_write(state_dir: Path, before: dict, deadline: float, slot:
                 prev = before.get(p)
                 if prev is None or prev[1] != mtime:
                     target, last_size, stable_since = p, size, time.monotonic()
-                    log.debug("Save: write detected — %s (%d bytes)", p.name, size)
+                    log.debug("Save: write detected: %s (%d bytes)", p.name, size)
                     break
         else:
             cur = after.get(target)
@@ -643,7 +714,7 @@ def _wait_for_sstate_write(state_dir: Path, before: dict, deadline: float, slot:
             elif cur[0] != last_size:
                 last_size, stable_since = cur[0], time.monotonic()
             elif time.monotonic() - stable_since >= STABLE_SECS:
-                log.info("Save: state write complete — %s (%d bytes)", target.name, last_size)
+                log.info("Save: state write complete: %s (%d bytes)", target.name, last_size)
                 return True
         time.sleep(POLL_SECS)
     return False
@@ -685,9 +756,9 @@ def _newest_state_for_slot(slot: int) -> Path | None:
 
 
 def _xdotool_save_state(slot: int) -> bool:
-    """Save emulator state to slot (1–8) via Shift+F{slot}.
+    """Save emulator state to slot (1-8) via Shift+F{slot}.
 
-    Dolphin maps Shift+F1–Shift+F8 directly to save slots 1–8, so no slot
+    Dolphin maps Shift+F1-Shift+F8 directly to save slots 1-8, so no slot
     cycling is needed. Sends the key then polls StateSaves for the write to
     complete (up to SSTATE_WAIT seconds) so a follow-up kill cannot land
     mid-flush. Falls back to a fixed 3 s sleep if StateSaves can't be found.
@@ -705,20 +776,20 @@ def _xdotool_save_state(slot: int) -> bool:
         return False
 
     if state_dir is None:
-        log.warning("Save: StateSaves dir not found — falling back to fixed 3.0s wait")
+        log.warning("Save: StateSaves dir not found, falling back to fixed 3.0s wait")
         time.sleep(3.0)
         return True
 
-    log.info("xdotool: shift+F%d sent to window %s — waiting for write (max %.1fs)", slot, wid, SSTATE_WAIT)
+    log.info("xdotool: shift+F%d sent to window %s, waiting for write (max %.1fs)", slot, wid, SSTATE_WAIT)
     if not _wait_for_sstate_write(state_dir, before, time.monotonic() + SSTATE_WAIT, slot):
         log.warning("Save: state write not confirmed within %.1fs (key was sent)", SSTATE_WAIT)
     return True
 
 
 def _xdotool_load_state(slot: int) -> bool:
-    """Load emulator state from slot (1–8) via F{slot}.
+    """Load emulator state from slot (1-8) via F{slot}.
 
-    Dolphin maps F1–F8 directly to load slots 1–8.
+    Dolphin maps F1-F8 directly to load slots 1-8.
     """
     wid = _xdotool_find_window()
     if wid is None:
@@ -771,7 +842,7 @@ def _pactl_get_mute() -> bool | None:
     return result.stdout.strip().endswith("yes")
 
 
-def _cleanup_sockets():
+def _restart_selkies():
     """Restart selkies to flush all stale gamepad connections."""
     log.info("Socket cleanup: restarting selkies...")
     result = subprocess.run(["pkill", "-15", "-f", "selkies"], capture_output=True)
@@ -787,10 +858,7 @@ def _cleanup_sockets():
 # every save file modified since the last game launch; PUT /save-file restores
 # a pulled archive before launch. Same guarded, mtime-last-write-wins mechanics
 # as Eden's implementation.
-_SAVE_DATA_ROOTS = (
-    Path("/config/.local/share/dolphin-emu"),
-    Path("/config/.config/dolphin-emu"),
-)
+#
 # Archive members must live under one of these root-relative subtrees; PUT
 # rejects anything else so a crafted zip cannot reach configs, keys or states.
 # The Slot-A card is listed so GameCube saves still round-trip on a container
@@ -816,22 +884,28 @@ def _save_data_root() -> Path | None:
 
 def _iter_save_files(root: Path) -> list[Path]:
     """Every regular file under the allowed save subtrees, sorted for a
-    deterministic archive (identical content zips to identical bytes)."""
+    deterministic archive (identical content zips to identical bytes).
+
+    os.walk, not rglob: rglob descends into symlinked directories, so a link
+    planted under GC/ would pull an arbitrary tree into the archive.
+    """
     files: list[Path] = []
     for sub in SAVE_SYNC_SUBTREES:
         base = root / sub
-        if not base.is_dir():
+        if base.is_symlink() or not base.is_dir():
             continue
-        files.extend(
-            p for p in sorted(base.rglob("*")) if p.is_file() and not p.is_symlink()
-        )
-    return files
+        for dirpath, _dirnames, filenames in os.walk(base):
+            for name in filenames:
+                p = Path(dirpath, name)
+                if p.is_file() and not p.is_symlink():
+                    files.append(p)
+    return sorted(files)
 
 
 def _build_save_archive(baseline: float) -> bytes | None:
     """Zip every save file modified since the last game launch.
 
-    Returns None when there is nothing to sync — no data dir yet, or no file
+    Returns None when there is nothing to sync: no data dir yet, or no file
     changed since `baseline`. Member paths are relative to the data dir so a
     later PUT restores them regardless of which candidate dir is live."""
     root = _save_data_root()
@@ -859,7 +933,7 @@ def _build_save_archive(baseline: float) -> bytes | None:
             try:
                 zf.write(p, p.relative_to(root).as_posix())
             except OSError as exc:
-                log.warning("save-file: could not read %s — %s", p, exc)
+                log.warning("save-file: could not read %s: %s", p, exc)
     return buf.getvalue()
 
 
@@ -884,7 +958,11 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
 
     Returns (written, skipped) on success, or an error string for a bad
     archive. Existing files newer than their archive member are skipped so a
-    restore can never roll back saves made since the archive was taken."""
+    restore can never roll back saves made since the archive was taken.
+
+    Every member is written to a temp file first and only renamed into place
+    once all of them are on disk: a failure partway through used to leave the
+    save tree half restored, with no record of which half."""
     root = _save_data_root() or _SAVE_DATA_ROOTS[0]
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
@@ -903,11 +981,12 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
             ):
                 return f"archive member outside save subtrees: {info.filename}"
 
-        written = skipped = 0
-        for info in infos:
-            target = root / PurePosixPath(info.filename)
-            mtime = time.mktime(info.date_time + (0, 0, -1))
-            try:
+        staged: list[tuple[Path, Path, float]] = []
+        skipped = 0
+        try:
+            for info in infos:
+                target = root / PurePosixPath(info.filename)
+                mtime = time.mktime(info.date_time + (0, 0, -1))
                 if (
                     target.exists()
                     and target.stat().st_mtime > mtime + _SAVE_MTIME_SLACK
@@ -918,12 +997,25 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
                 tmp = target.parent / f".{target.name}.tmp"
                 tmp.write_bytes(zf.read(info))
                 os.chown(tmp, _LOG_UID, _LOG_GID)
+                staged.append((tmp, target, mtime))
+        except OSError as exc:
+            for tmp, _target, _mtime in staged:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            return f"could not write {info.filename}: {exc}"
+
+        for tmp, target, mtime in staged:
+            try:
                 os.replace(tmp, target)
                 os.utime(target, (mtime, mtime))
             except OSError as exc:
-                return f"could not write {info.filename}: {exc}"
-            written += 1
-    return (written, skipped)
+                # Past the point of no return: some files are already live.
+                # Report it rather than pretending the restore was clean.
+                log.error("save-file: could not commit %s: %s", target, exc)
+                return f"could not write {target.name}: {exc}"
+    return (len(staged), skipped)
 
 
 # ── State screenshots ─────────────────────────────────────────────────────────
@@ -977,7 +1069,10 @@ def _capture_state_screenshot(wid: str, slot: int) -> bool:
         return False
 
     # The hotkey returns before the encode finishes, so wait for a stable size.
+    # This gets its own budget: sharing the appear deadline meant a PNG that
+    # showed up late was filed at whatever size it happened to be mid-encode.
     last = -1
+    deadline = time.monotonic() + SCREENSHOT_WAIT
     while time.monotonic() < deadline:
         try:
             size = shot.stat().st_size
@@ -987,6 +1082,8 @@ def _capture_state_screenshot(wid: str, slot: int) -> bool:
             break
         last = size
         time.sleep(0.2)
+    else:
+        log.warning("screenshot: %s never stopped growing, filing it anyway", shot.name)
 
     target = _state_shot_path(slot)
     try:
@@ -1050,6 +1147,11 @@ def _build_memory_card_archive() -> bytes | None | str:
 
 
 def _replace_memory_card(content: bytes) -> tuple[int] | str:
+    with _memory_card_lock:
+        return _replace_memory_card_locked(content)
+
+
+def _replace_memory_card_locked(content: bytes) -> tuple[int] | str:
     """Wipe the Slot-A card and lay down the pulled card image. Returns
     (written,) on success or an error string. The whole card is replaced (no
     per-file mtime merge): this is the hydrate-with-isolation guarantee for
@@ -1073,8 +1175,8 @@ def _replace_memory_card(content: bytes) -> tuple[int] | str:
                 return f"archive member escapes card dir: {info.filename}"
 
         parent = path.parent
-        staging = parent / f".{path.name}.new-{os.getpid()}"
-        backup = parent / f".{path.name}.old-{os.getpid()}"
+        staging = parent / f".{path.name}.new"
+        backup = parent / f".{path.name}.old"
         shutil.rmtree(staging, ignore_errors=True)
         try:
             _mkdirs_owned(staging)
@@ -1140,7 +1242,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _read_body(self) -> dict:
+    def _read_body(self) -> dict | None:
+        """Parsed JSON body, or None once a 400 has been sent for a bad one.
+
+        Malformed JSON used to read back as {}, so a typo'd /launch silently
+        became a dashboard relaunch instead of an error the caller could see.
+        """
         try:
             length = max(0, min(int(self.headers.get("Content-Length", 0)), 64 * 1024))
         except ValueError:
@@ -1148,9 +1255,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if length == 0:
             return {}
         try:
-            return json.loads(self.rfile.read(length))
-        except json.JSONDecodeError:
-            return {}
+            body = json.loads(self.rfile.read(length))
+        except json.JSONDecodeError as exc:
+            self._send_json(400, {"error": f"invalid JSON body: {exc.msg}"})
+            return None
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "body must be a JSON object"})
+            return None
+        return body
 
     def _get_state_file(self):
         query = parse_qs(urlparse(self.path).query)
@@ -1162,7 +1274,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if slot == 0:
             slot = SAVE_SLOT
         if not (1 <= slot <= MAX_SLOT):
-            self._send_json(400, {"error": f"slot must be 0–{MAX_SLOT}"})
+            self._send_json(400, {"error": f"slot must be 0-{MAX_SLOT}"})
             return
 
         # Block while a save is being written so the caller never receives a
@@ -1174,6 +1286,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "no state file for slot", "slot": slot})
             return
         try:
+            # Size first: reading then measuring would pull an oversized state
+            # entirely into memory only to refuse it.
+            if state_path.stat().st_size > STATE_FILE_MAX_BYTES:
+                self._send_json(413, {"error": "state file exceeds size limit"})
+                return
             content = state_path.read_bytes()
         except OSError as exc:
             self._send_json(500, {"error": f"could not read state file: {exc}"})
@@ -1199,7 +1316,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if slot == 0:
             slot = SAVE_SLOT
         if not (1 <= slot <= MAX_SLOT):
-            self._send_json(400, {"error": f"slot must be 0–{MAX_SLOT}"})
+            self._send_json(400, {"error": f"slot must be 0-{MAX_SLOT}"})
             return
 
         # A save in flight is about to overwrite this slot's thumbnail; wait it
@@ -1226,12 +1343,23 @@ class BrokerHandler(BaseHTTPRequestHandler):
         with _session_lock:
             baseline = _session["save_baseline"]
             rom_name = _session["rom_name"]
+        # Both misses are 404, so they are tagged: "unchanged" means the card is
+        # good and RomM should keep what it has, "absent" means there is nothing
+        # to compare against. An untagged 404 is a missing endpoint.
         if baseline is None:
-            self._send_json(404, {"error": "no game has been launched"})
+            self._send_json(
+                404,
+                {"error": "no game has been launched"},
+                headers={"X-Save-File": "absent"},
+            )
             return
         archive = _build_save_archive(baseline)
         if archive is None:
-            self._send_json(404, {"error": "no save changes since last launch"})
+            self._send_json(
+                404,
+                {"error": "no save changes since last launch"},
+                headers={"X-Save-File": "unchanged"},
+            )
             return
         # Header values must be latin-1; ROM stems can be anything.
         safe_name = "".join(
@@ -1257,12 +1385,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(413, {"error": "archive too large"})
             return
         content = self.rfile.read(length)
+        if len(content) != length:
+            self._send_json(400, {"error": "truncated request body"})
+            return
         result = _extract_save_archive(content)
         if isinstance(result, str):
             self._send_json(400, {"error": result})
             return
         written, skipped = result
-        log.info("save-file: restored archive — %d written, %d skipped", written, skipped)
+        log.info("save-file: restored archive: %d written, %d skipped", written, skipped)
         self._send_json(200, {"status": "ok", "written": written, "skipped": skipped})
 
     def _get_memory_card(self):
@@ -1308,7 +1439,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": result})
             return
         (written,) = result
-        log.info("memory-card: replaced slot-A card — %d files", written)
+        log.info("memory-card: replaced slot-A card: %d files", written)
         self._send_json(200, {"status": "ok", "written": written})
 
     def do_PUT(self):
@@ -1326,7 +1457,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
 
-        # Basename only — the filename came from a previous GET and is written
+        # Basename only: the filename came from a previous GET and is written
         # back verbatim so Dolphin recognises the slot; path parts are rejected.
         raw_name = parse_qs(parsed.query).get("filename", [""])[0]
         filename = Path(raw_name).name
@@ -1414,7 +1545,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/cleanup":
-            Thread(target=_cleanup_sockets, daemon=True).start()
+            Thread(target=_restart_selkies, daemon=True).start()
             self._send_json(200, {"status": "cleanup started"})
             return
 
@@ -1428,11 +1559,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 _session["save_in_progress"] = True
             body = self._read_body()
+            if body is None:
+                with _session_lock:
+                    _session["save_in_progress"] = False
+                return
             slot = body.get("slot", SAVE_SLOT)
             if not isinstance(slot, int) or not (0 <= slot <= MAX_SLOT):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": f"slot must be 0–{MAX_SLOT}"})
+                self._send_json(400, {"error": f"slot must be 0-{MAX_SLOT}"})
                 return
             # Slot 0 means "use the default slot", matching the pcsx2 broker.
             if slot == 0:
@@ -1445,7 +1580,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     with _session_lock:
                         _session["save_in_progress"] = False
                 if not ok:
-                    log.warning("save-and-exit: save key failed (slot %d) — killed anyway", slot)
+                    log.warning("save-and-exit: save key failed (slot %d), killed anyway", slot)
                 self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
                 Thread(target=_launch_dolphin, args=(None,), daemon=True).start()
             else:
@@ -1456,7 +1591,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         with _session_lock:
                             _session["save_in_progress"] = False
                     if not ok:
-                        log.warning("save-and-exit: save key failed (slot %d) — killed anyway", s)
+                        log.warning("save-and-exit: save key failed (slot %d), killed anyway", s)
                     _launch_dolphin(None)
                 Thread(target=_bg, args=(slot,), daemon=True).start()
                 self._send_json(200, {"status": "queued", "slot": slot})
@@ -1464,9 +1599,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         if self.path == "/volume":
             body = self._read_body()
+            if body is None:
+                return
             level = body.get("level")
             if not isinstance(level, int) or not (0 <= level <= 100):
-                self._send_json(400, {"error": "level must be an integer 0–100"})
+                self._send_json(400, {"error": "level must be an integer 0-100"})
                 return
             result = _pactl("set-sink-volume", "@DEFAULT_SINK@", f"{level}%")
             if result.returncode != 0:
@@ -1478,6 +1615,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         if self.path == "/mute":
             body = self._read_body()
+            if body is None:
+                return
             if "mute" in body:
                 mute_arg = "1" if body["mute"] else "0"
             else:
@@ -1501,11 +1640,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 _session["save_in_progress"] = True
             body = self._read_body()
+            if body is None:
+                with _session_lock:
+                    _session["save_in_progress"] = False
+                return
             slot = body.get("slot", SAVE_SLOT)
             if not isinstance(slot, int) or not (0 <= slot <= MAX_SLOT):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": f"slot must be 0–{MAX_SLOT}"})
+                self._send_json(400, {"error": f"slot must be 0-{MAX_SLOT}"})
                 return
             # Slot 0 means "use the default slot", matching the pcsx2 broker.
             if slot == 0:
@@ -1530,9 +1673,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     self._send_json(409, {"error": "no game is running"})
                     return
             body = self._read_body()
+            if body is None:
+                return
             slot = body.get("slot", SAVE_SLOT)
             if not isinstance(slot, int) or not (0 <= slot <= MAX_SLOT):
-                self._send_json(400, {"error": f"slot must be 0–{MAX_SLOT}"})
+                self._send_json(400, {"error": f"slot must be 0-{MAX_SLOT}"})
                 return
             # Slot 0 means "use the default slot", matching the pcsx2 broker.
             if slot == 0:
@@ -1551,7 +1696,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
 
         body = self._read_body()
-        raw_path = body.get("rom_path", "").strip()
+        if body is None:
+            return
+        raw_path = body.get("rom_path")
+        raw_path = raw_path.strip() if isinstance(raw_path, str) else ""
 
         if not raw_path:
             self._send_json(400, {"error": "rom_path is required"})
@@ -1570,11 +1718,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         # Resume-from-state: hand the state to Dolphin at boot.
         load_slot = body.get("load_slot")
-        if load_slot is not None and (
-            not isinstance(load_slot, int) or not (1 <= load_slot <= MAX_SLOT)
-        ):
-            self._send_json(400, {"error": f"load_slot must be 1–{MAX_SLOT}"})
-            return
+        if load_slot is not None:
+            if not isinstance(load_slot, int) or not (0 <= load_slot <= MAX_SLOT):
+                self._send_json(400, {"error": f"load_slot must be 0-{MAX_SLOT}"})
+                return
+            # Slot 0 means "use the default slot", as it does on every other route.
+            if load_slot == 0:
+                load_slot = SAVE_SLOT
 
         # Same slot-to-file resolution GET /state-file uses. A resume is always
         # preceded by RomM PUTting the state, so the newest file for the slot is
@@ -1590,8 +1740,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-        with _session_lock:
-            _session["launch_in_progress"] = True
         Thread(
             target=_launch_dolphin,
             args=(str(rom_path), str(state_path) if state_path else None),
@@ -1618,12 +1766,25 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+_shutting_down = False
+
+
 def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
     """Stop the HTTP listener, let any in-flight save finish, then kill Dolphin.
-    Triggered on SIGTERM/SIGINT — serve_forever()'s KeyboardInterrupt path does
+    Triggered on SIGTERM/SIGINT: serve_forever()'s KeyboardInterrupt path does
     not cover SIGTERM from s6/systemd, which previously hard-killed Dolphin
-    mid-savestate on container stop."""
-    log.info("Received signal %d — beginning graceful shutdown", signum)
+    mid-savestate on container stop.
+
+    The wait runs in the signal handler, so it blocks the main thread. A second
+    signal arriving during it (s6 escalating, or an impatient Ctrl-C) means the
+    operator wants out now, so it skips the wait rather than re-entering it."""
+    global _shutting_down
+    if _shutting_down:
+        log.warning("Received signal %d during shutdown, killing Dolphin now", signum)
+        _kill_dolphin()
+        return
+    _shutting_down = True
+    log.info("Received signal %d, beginning graceful shutdown", signum)
     Thread(target=server.shutdown, daemon=True).start()
 
     deadline = time.monotonic() + max(SSTATE_WAIT, 5.0)
@@ -1633,17 +1794,16 @@ def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
                 break
         time.sleep(0.2)
     else:
-        log.warning("Shutdown: in-flight save did not complete within %.1fs — killing Dolphin anyway", SSTATE_WAIT)
+        log.warning("Shutdown: in-flight save did not complete within %.1fs, killing Dolphin anyway", SSTATE_WAIT)
 
     _kill_dolphin()
     log.info("Shutdown complete")
 
 
 def main():
-    log.info("Broker starting — waiting 5s for desktop...")
     if not SECRET:
-        log.warning("BROKER_SECRET is not set — all POST/DELETE endpoints are unauthenticated")
-    time.sleep(5)
+        log.warning("BROKER_SECRET is not set: all POST/DELETE endpoints are unauthenticated")
+    _wait_for_display()
 
     # Kill any stale Dolphin instance left from a previous broker run.
     # -x matches the process name exactly; -f with a path substring would also
@@ -1656,7 +1816,7 @@ def main():
     _patch_ini()
 
     # Clean up any leftover selkies socket files from a previous container run.
-    # Only done once at startup — not on game launches, where webrtc_input is
+    # Only done once at startup, not on game launches, where webrtc_input is
     # already running and manages its own socket lifecycle.
     _cleanup_stale_sockets()
 

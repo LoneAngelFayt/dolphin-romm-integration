@@ -70,7 +70,7 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
 | `GET` | `/status` | Current session info including slot config |
-| `POST` | `/launch` | Launch a ROM (`{"rom_path": "..."}`). Optional `"load_slot": N` (1–8) resumes from that state slot: the broker resolves the slot to its state file and passes it to Dolphin as `--save_state`, so the state is applied during boot, before emulation starts — the game is never seen running un-resumed. Returns `404` if the slot has no state file. Push the state file via `PUT /state-file` before launching. |
+| `POST` | `/launch` | Launch a ROM (`{"rom_path": "..."}`). Optional `"load_slot": N` (`0` or omitted resolves to `SAVE_SLOT`; `1`-`8` addressable) resumes from that state slot: the broker resolves the slot to its state file and passes it to Dolphin as `--save_state`, so the state is applied during boot, before emulation starts, so the game is never seen running un-resumed. Returns `404` if the slot has no state file. Push the state file via `PUT /state-file` before launching. |
 | `DELETE` | `/launch` | Return to Dolphin dashboard |
 | `POST` | `/save-and-exit` | Save then stop game (`{"slot": N, "wait": true}`, `0` or omitted = `SAVE_SLOT`) |
 | `POST` | `/save-state` | Save state in background (`{"slot": N}`, `0` or omitted = `SAVE_SLOT`) |
@@ -78,7 +78,7 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 | `GET` | `/state-file?slot=N` | Newest state file for slot N as raw bytes; the filename is echoed in the `X-State-Filename` header. Blocks while a save is in flight (up to `STATE_GET_WAIT`) so a GET after `/save-state` carries the finished write. `slot=0` resolves to `SAVE_SLOT`; returns `404` if the slot has no state. |
 | `PUT` | `/state-file?filename=NAME` | Write raw body into StateSaves as `NAME` (used by RomM to hydrate a claimed container). `NAME` must be a bare `<GameID>.sNN` basename; write is atomic and chowned to `abc`. Max 256 MB. |
 | `GET` | `/state-screenshot?slot=N` | PNG frame captured at the moment slot N was saved, used by RomM as the state's thumbnail. `404` if the slot has no capture. |
-| `GET` | `/save-file` | Zip of every in-game save (GC cards, Wii NAND titles) modified since the last game launch; `404` when nothing changed. |
+| `GET` | `/save-file` | Zip of every in-game save (GC cards, Wii NAND titles) modified since the last game launch. `404` with `X-Save-File: unchanged` when nothing changed, or `X-Save-File: absent` when no game has been launched. An untagged `404` means the endpoint is missing, not that there is nothing to sync. |
 | `PUT` | `/save-file` | Restore a pulled save archive. Files newer in the container than in the archive are skipped. Max 256 MB. |
 | `GET` | `/memory-card` | Zip of the whole Slot-A GCI folder card, member paths relative to the card root. `404` with `X-Memory-Card: absent` when no card exists yet. |
 | `PUT` | `/memory-card` | Wipe Slot A and lay down the card in the body. Staged then swapped, so a failure never leaves a half-wiped card. Max 256 MB. |
@@ -111,14 +111,14 @@ frame. It is best effort throughout: a failed capture never fails the save.
 
 ### Save State Slots
 
-Dolphin supports 8 save state slots. RomM offers no slot selection, so **all state I/O funnels through a single slot — `SAVE_SLOT` (env, default 8)**, the same shape the pcsx2 broker uses. Splitting manual saves and auto-saves across two slots would only split the library's view of a session across two files.
+Dolphin supports 8 save state slots. RomM offers no slot selection, so **all state I/O funnels through a single slot, `SAVE_SLOT` (env, default 8)**, the same shape the pcsx2 broker uses. Splitting manual saves and auto-saves across two slots would only split the library's view of a session across two files.
 
 | Action | Slot | Hotkey |
 |--------|------|--------|
-| Save | `SAVE_SLOT` (`0` or omitted resolves to it; `1`–`8` addressable) | `Shift+F1` – `Shift+F8` |
-| Load | `SAVE_SLOT` (`0` or omitted resolves to it; `1`–`8` addressable) | `F1` – `F8` |
+| Save | `SAVE_SLOT` (`0` or omitted resolves to it; `1`-`8` addressable) | `Shift+F1` - `Shift+F8` |
+| Load | `SAVE_SLOT` (`0` or omitted resolves to it; `1`-`8` addressable) | `F1` - `F8` |
 
-`SAVE_SLOT` is written by manual saves, by save-and-exit, and automatically whenever you navigate away from a game (switch titles or click save-and-exit); every read defaults to it. The explicit `1`–`8` range stays addressable for debugging.
+`SAVE_SLOT` is written by manual saves, by save-and-exit, and automatically whenever you navigate away from a game (switch titles or click save-and-exit); every read defaults to it. The explicit `1`-`8` range stays addressable for debugging.
 
 ---
 
@@ -129,9 +129,10 @@ Dolphin supports 8 save state slots. RomM offers no slot selection, so **all sta
 | `BROKER_PORT` | `8000` | HTTP port the broker listens on |
 | `BROKER_SECRET` | _(empty)_ | Shared secret for request auth (`X-Broker-Secret` header) |
 | `ROM_ROOT` | `/romm/library` | ROM files must be within this path |
-| `SAVE_SLOT` | `8` | The one slot every state save and load uses (1–8) |
+| `SAVE_SLOT` | `8` | The one slot every state save and load uses (1-8) |
 | `SSTATE_WAIT` | `3.0` | Seconds to wait after save key before killing Dolphin |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` blocks waiting for an in-flight save to finish |
+| `DISPLAY_WAIT` | `30.0` | Max seconds to wait for the X server socket before starting anyway |
 | `SCREENSHOT_WAIT` | `5.0` | Max seconds to wait for the screenshot hotkey to produce a PNG before giving up on the state thumbnail |
 | `GCI_CARD_DIR` | _(derived)_ | Slot-A GCI folder card path; defaults to `romm/Card A` under Dolphin's data dir |
 | `BROKER_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`) |
@@ -140,7 +141,7 @@ Dolphin supports 8 save state slots. RomM offers no slot selection, so **all sta
 
 ## Controller Setup
 
-The mod uses the [selkies joystick interposer](https://github.com/selkies-project/selkies-gstreamer) to forward browser gamepad input into the container as virtual Xbox 360 pads (`SDL/0–3/Microsoft X-Box 360 pad`).
+The mod uses the [selkies joystick interposer](https://github.com/selkies-project/selkies-gstreamer) to forward browser gamepad input into the container as virtual Xbox 360 pads (`SDL/0-3/Microsoft X-Box 360 pad`).
 
 ### Default mapping
 
@@ -161,7 +162,7 @@ The file is at `<your-config-volume>/.config/dolphin-emu/GCPadNew.ini`. Restart 
 
 ### Persisting controller config
 
-Controller mapping and calibration are stored in the `/config` volume and survive game switches. Dolphin does **not** auto-save controller settings on exit — you must click the **Close** button (not just OK) in Dolphin's controller settings dialog to write changes to disk.
+Controller mapping and calibration are stored in the `/config` volume and survive game switches. Dolphin does **not** auto-save controller settings on exit: you must click the **Close** button (not just OK) in Dolphin's controller settings dialog to write changes to disk.
 
 ---
 
@@ -198,10 +199,10 @@ The broker controls PulseAudio sink volume for the `abc` user. Verify PulseAudio
 **Controller input stops working after game switch**
 This is prevented by `BackgroundInput = True` in `Dolphin.ini` (set automatically by the broker). If input drops, check the broker log for socket cleanup warnings.
 
-**Nothing reaches Dolphin — neither broker hotkeys nor browser gamepad**
+**Nothing reaches Dolphin, neither broker hotkeys nor browser gamepad**
 Both transports die together when Dolphin's global input gate shuts, so treat
 simultaneous failure as one bug, not two. The gate is fed by two settings whose
-Dolphin sections differ and whose defaults both demand render-window focus —
+Dolphin sections differ and whose defaults both demand render-window focus,
 focus the window never gets, since Dolphin is an Xwayland client under labwc:
 
 | Setting | Section | Default | Broker sets |
