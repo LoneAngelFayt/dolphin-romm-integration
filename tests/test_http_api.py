@@ -256,6 +256,19 @@ class SaveAndLoadState(ApiTestCase):
     def test_load_state_requires_a_running_game(self):
         self.assertEqual(self.request("POST", "/load-state", {}).status, 409)
 
+    def test_load_state_is_refused_while_a_save_is_running(self):
+        # Every other slot route already refuses this; a load that lands
+        # mid-save rolls the player back onto the state being overwritten.
+        self.start_session()
+        with broker._session_lock:
+            broker._session["save_in_progress"] = True
+        try:
+            resp = self.request("POST", "/load-state", {})
+        finally:
+            with broker._session_lock:
+                broker._session["save_in_progress"] = False
+        self.assertEqual(resp.status, 409)
+
     def test_save_state_defaults_to_the_configured_slot(self):
         self.start_session()
         body = self.request("POST", "/save-state", {}).json()
@@ -387,6 +400,27 @@ class StateFileTransfer(ApiTestCase):
             with self.subTest(name=name):
                 resp = self.request("PUT", f"/state-file?filename={name}", raw=b"x")
                 self.assertEqual(resp.status, 400)
+
+    def test_put_rejects_a_slot_outside_the_supported_range(self):
+        # .sNN parsed as a slot: .s99 is a well-formed name for a slot nothing
+        # else reads back, so it must not be writable either.
+        for name in ("GALE01.s00", "GALE01.s09", "GALE01.s99"):
+            with self.subTest(name=name):
+                resp = self.request("PUT", f"/state-file?filename={name}", raw=b"x")
+                self.assertEqual(resp.status, 400)
+                self.assertNotIn(name, [p.name for p in self.state_dir.iterdir()])
+
+    def test_get_refuses_to_serve_while_a_save_is_still_running(self):
+        write(self.state_dir / "GALE01.s08", b"state")
+        with broker._session_lock:
+            broker._session["save_in_progress"] = True
+        try:
+            with unittest.mock.patch.object(broker, "STATE_GET_WAIT", 0.3):
+                resp = self.request("GET", "/state-file?slot=8")
+        finally:
+            with broker._session_lock:
+                broker._session["save_in_progress"] = False
+        self.assertEqual(resp.status, 409)
 
     def test_put_rejects_an_empty_body(self):
         resp = self.request("PUT", "/state-file?filename=GALE01.s08", raw=b"")

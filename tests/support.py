@@ -32,7 +32,12 @@ broker = _load_broker()
 
 
 def reset_session():
-    """Return the session dict to its post-import state."""
+    """Return the session dict to its post-import state.
+
+    Every key is listed rather than update()-ing a subset: a leftover
+    relaunch_failures count carries into the next test and changes how many
+    crashes the monitor tolerates there.
+    """
     with broker._session_lock:
         broker._session.update(
             process=None,
@@ -41,8 +46,8 @@ def reset_session():
             started_at=None,
             is_managed=False,
             save_in_progress=False,
-            launch_in_progress=False,
             save_baseline=None,
+            relaunch_failures=0,
         )
 
 

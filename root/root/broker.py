@@ -12,6 +12,7 @@ import signal
 import socket as _socket
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -416,7 +417,12 @@ def _spawn_dolphin(rom_path, state_path=None):
             cmd,
             stdout=log_fh if log_fh else subprocess.DEVNULL,
             stderr=subprocess.STDOUT if log_fh else subprocess.DEVNULL,
-            preexec_fn=os.setpgrp,
+            # start_new_session, not preexec_fn=os.setpgrp: this process runs a
+            # ThreadingHTTPServer, and a preexec_fn runs between fork and exec
+            # in a threaded parent, where it can deadlock on a lock another
+            # thread held at fork time. setsid gives the same killable process
+            # group without running Python in the child.
+            start_new_session=True,
         )
     except Exception as exc:
         log.error("Failed to launch Dolphin: %s", exc)
@@ -443,31 +449,35 @@ def _monitor_process(proc, start_time):
     proc.wait()
     duration = time.monotonic() - start_time
 
-    with _session_lock:
-        should_relaunch = _session["is_managed"] and _session["process"] is proc
-
-    if not should_relaunch:
-        return
-
     # A dashboard that dies immediately dies again on relaunch, so back off and
     # eventually stop: an uncapped loop respawned a broken Dolphin forever and
     # buried the reason under thousands of identical log lines.
-    if duration >= RELAUNCH_HEALTHY_SECONDS:
-        failures = 0
-        wait_time = 1
-    else:
-        with _session_lock:
-            failures = _session["relaunch_failures"] + 1
-        if failures > RELAUNCH_MAX_FAILURES:
-            log.error(
-                "Dolphin exited after %.1fs on %d consecutive relaunches, giving up",
-                duration, failures - 1,
-            )
-            with _session_lock:
-                _session["is_managed"] = False
-                _session["relaunch_failures"] = 0
+    #
+    # The counter is read, incremented and stored under one lock acquisition,
+    # before the backoff sleep. Committing it after the sleep let a second
+    # monitor thread (a relaunch that died while this one waited) read the old
+    # value, so two crash loops each counted from zero and neither gave up.
+    with _session_lock:
+        if not (_session["is_managed"] and _session["process"] is proc):
             return
-        wait_time = min(RELAUNCH_BACKOFF_CAP, RELAUNCH_BACKOFF_BASE * 2 ** (failures - 1))
+        if duration >= RELAUNCH_HEALTHY_SECONDS:
+            failures = _session["relaunch_failures"] = 0
+            wait_time = 1
+        else:
+            failures = _session["relaunch_failures"] = _session["relaunch_failures"] + 1
+            wait_time = min(
+                RELAUNCH_BACKOFF_CAP, RELAUNCH_BACKOFF_BASE * 2 ** (failures - 1)
+            )
+
+    if failures > RELAUNCH_MAX_FAILURES:
+        log.error(
+            "Dolphin exited after %.1fs on %d consecutive relaunches, giving up",
+            duration, RELAUNCH_MAX_FAILURES,
+        )
+        with _session_lock:
+            _session["is_managed"] = False
+            _session["relaunch_failures"] = 0
+        return
 
     log.info("Dolphin exited after %.1fs, relaunching dashboard in %ds", duration, wait_time)
     time.sleep(wait_time)
@@ -475,7 +485,6 @@ def _monitor_process(proc, start_time):
     with _session_lock:
         if not _session["is_managed"]:
             return
-        _session["relaunch_failures"] = failures
 
     _launch_dolphin(None)
 
@@ -728,15 +737,24 @@ def _wait_for_sstate_write(state_dir: Path, before: dict, deadline: float, slot:
 
 STATE_FILE_MAX_BYTES = 256 * 1024 * 1024
 STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
+# Transfers move through the socket and the filesystem in chunks this size, so
+# a request costs a fixed amount of memory instead of its whole payload.
+_STREAM_CHUNK = 1024 * 1024
 
 
-def _wait_for_save_idle(deadline: float) -> None:
-    """Block until no save is in flight, or the deadline passes."""
+def _wait_for_save_idle(deadline: float) -> bool:
+    """Block until no save is in flight. False if the deadline passed first.
+
+    The caller needs to tell "the save finished" from "we gave up waiting":
+    returning nothing made both look identical, so a timeout silently served
+    whatever half-written file happened to be on disk.
+    """
     while time.monotonic() < deadline:
         with _session_lock:
             if not _session["save_in_progress"]:
-                return
+                return True
         time.sleep(0.2)
+    return False
 
 
 def _newest_state_for_slot(slot: int) -> Path | None:
@@ -882,24 +900,56 @@ def _save_data_root() -> Path | None:
     return None
 
 
+def _walk_regular_files(base: Path) -> list[Path]:
+    """Every regular file under base, never crossing a symlink.
+
+    os.walk (which does not follow directory symlinks), not rglob: rglob
+    descends into symlinked directories, so a link planted under the tree would
+    pull an arbitrary part of the filesystem into an archive.
+    """
+    if base.is_symlink() or not base.is_dir():
+        return []
+    files: list[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(base):
+        for name in filenames:
+            p = Path(dirpath, name)
+            if p.is_file() and not p.is_symlink():
+                files.append(p)
+    return files
+
+
 def _iter_save_files(root: Path) -> list[Path]:
     """Every regular file under the allowed save subtrees, sorted for a
     deterministic archive (identical content zips to identical bytes).
-
-    os.walk, not rglob: rglob descends into symlinked directories, so a link
-    planted under GC/ would pull an arbitrary tree into the archive.
     """
     files: list[Path] = []
     for sub in SAVE_SYNC_SUBTREES:
-        base = root / sub
-        if base.is_symlink() or not base.is_dir():
-            continue
-        for dirpath, _dirnames, filenames in os.walk(base):
-            for name in filenames:
-                p = Path(dirpath, name)
-                if p.is_file() and not p.is_symlink():
-                    files.append(p)
+        files.extend(_walk_regular_files(root / sub))
     return sorted(files)
+
+
+def _open_archive(source: bytes | Path) -> zipfile.ZipFile:
+    """Open a pulled archive from memory or from a spooled temp file."""
+    return zipfile.ZipFile(io.BytesIO(source) if isinstance(source, bytes) else source)
+
+
+def _read_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, budget: int) -> bytes:
+    """Decompress one member, refusing to produce more than `budget` bytes.
+
+    info.file_size is the archive's own claim about the member and a crafted
+    zip can understate it by orders of magnitude, so the declared-size total is
+    only a cheap first pass: the actual read is capped and checked. Raises
+    ValueError when the member overruns or when the member itself is corrupt,
+    so one bad entry is reported as a rejected archive and not as a 500.
+    """
+    try:
+        with zf.open(info) as fh:
+            data = fh.read(budget + 1)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"archive member {info.filename} is corrupt: {exc}") from exc
+    if len(data) > budget:
+        raise ValueError(f"archive member {info.filename} exceeds the size limit")
+    return data
 
 
 def _build_save_archive(baseline: float) -> bytes | None:
@@ -953,7 +1003,7 @@ def _mkdirs_owned(path: Path) -> None:
             pass
 
 
-def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
+def _extract_save_archive(source: bytes | Path) -> tuple[int, int] | str:
     """Restore a pulled save archive into the data dir.
 
     Returns (written, skipped) on success, or an error string for a bad
@@ -965,13 +1015,14 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
     save tree half restored, with no record of which half."""
     root = _save_data_root() or _SAVE_DATA_ROOTS[0]
     try:
-        zf = zipfile.ZipFile(io.BytesIO(content))
+        zf = _open_archive(source)
     except zipfile.BadZipFile:
         return "body is not a zip archive"
     with zf:
         infos = [i for i in zf.infolist() if not i.is_dir()]
         if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
             return "archive exceeds size limit when extracted"
+        budget = SAVE_FILE_MAX_BYTES
         for info in infos:
             member = PurePosixPath(info.filename)
             if member.is_absolute() or ".." in member.parts:
@@ -993,12 +1044,14 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
                 ):
                     skipped += 1
                     continue
+                data = _read_member(zf, info, budget)
+                budget -= len(data)
                 _mkdirs_owned(target.parent)
                 tmp = target.parent / f".{target.name}.tmp"
-                tmp.write_bytes(zf.read(info))
+                tmp.write_bytes(data)
                 os.chown(tmp, _LOG_UID, _LOG_GID)
                 staged.append((tmp, target, mtime))
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             for tmp, _target, _mtime in staged:
                 try:
                     tmp.unlink()
@@ -1045,7 +1098,7 @@ def _screenshot_snapshot(root: Path) -> set:
     """Every PNG currently under the ScreenShots tree, one game dir per title."""
     if not root.is_dir():
         return set()
-    return {p for p in root.rglob("*.png") if p.is_file()}
+    return {p for p in _walk_regular_files(root) if p.suffix.lower() == ".png"}
 
 
 def _capture_state_screenshot(wid: str, slot: int) -> bool:
@@ -1126,7 +1179,7 @@ def _build_memory_card_archive() -> bytes | None | str:
         return "slot A card path is a file; a GCI folder is required"
     if not path.is_dir():
         return None
-    files = [p for p in sorted(path.rglob("*")) if p.is_file() and not p.is_symlink()]
+    files = sorted(_walk_regular_files(path))
     total = 0
     for p in files:
         try:
@@ -1146,12 +1199,32 @@ def _build_memory_card_archive() -> bytes | None | str:
     return buf.getvalue()
 
 
-def _replace_memory_card(content: bytes) -> tuple[int] | str:
+def _replace_memory_card(source: bytes | Path) -> tuple[int] | str:
     with _memory_card_lock:
-        return _replace_memory_card_locked(content)
+        return _replace_memory_card_locked(source)
 
 
-def _replace_memory_card_locked(content: bytes) -> tuple[int] | str:
+def _recover_memory_card() -> None:
+    """Put the slot-A card back if a previous run died mid-swap.
+
+    _replace_memory_card_locked moves the live card aside to `.Card A.old`
+    before moving the staged one into place. A crash or container stop inside
+    that window leaves no card at all, and the backup is then the only copy of
+    the user's saves, so it is reclaimed on the next boot rather than sitting
+    there as a dotfile nobody looks for.
+    """
+    path = _gci_card_path()
+    backup = path.parent / f".{path.name}.old"
+    if path.exists() or not backup.is_dir():
+        return
+    try:
+        os.replace(backup, path)
+        log.warning("memory-card: restored slot-A card from %s after an interrupted swap", backup)
+    except OSError as exc:
+        log.error("memory-card: could not restore %s from %s: %s", path, backup, exc)
+
+
+def _replace_memory_card_locked(source: bytes | Path) -> tuple[int] | str:
     """Wipe the Slot-A card and lay down the pulled card image. Returns
     (written,) on success or an error string. The whole card is replaced (no
     per-file mtime merge): this is the hydrate-with-isolation guarantee for
@@ -1162,13 +1235,14 @@ def _replace_memory_card_locked(content: bytes) -> tuple[int] | str:
         log.warning("memory-card: hydrate rejected, slot A path is a file at %s", path)
         return "slot A card path is a file; a GCI folder is required"
     try:
-        zf = zipfile.ZipFile(io.BytesIO(content))
+        zf = _open_archive(source)
     except zipfile.BadZipFile:
         return "body is not a zip archive"
     with zf:
         infos = [i for i in zf.infolist() if not i.is_dir()]
         if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
             return "archive exceeds size limit when extracted"
+        budget = SAVE_FILE_MAX_BYTES
         for info in infos:
             member = PurePosixPath(info.filename)
             if member.is_absolute() or ".." in member.parts:
@@ -1183,9 +1257,11 @@ def _replace_memory_card_locked(content: bytes) -> tuple[int] | str:
             written = 0
             for info in infos:
                 target = staging / PurePosixPath(info.filename)
+                data = _read_member(zf, info, budget)
+                budget -= len(data)
                 _mkdirs_owned(target.parent)
                 tmp = target.parent / f".{target.name}.tmp"
-                tmp.write_bytes(zf.read(info))
+                tmp.write_bytes(data)
                 os.chown(tmp, _LOG_UID, _LOG_GID)
                 os.replace(tmp, target)
                 written += 1
@@ -1195,7 +1271,7 @@ def _replace_memory_card_locked(content: bytes) -> tuple[int] | str:
             if path.exists():
                 os.replace(path, backup)
             os.replace(staging, path)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             shutil.rmtree(staging, ignore_errors=True)
             # If we moved the old card aside but never put the new one in place,
             # restore it so a mid-swap failure never leaves the user cardless.
@@ -1264,6 +1340,46 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return None
         return body
 
+    def _spool_body(self, limit: int):
+        """Stream the request body to a temp file, or None once an error is sent.
+
+        Returns the path to a spooled copy the caller must unlink. Bodies used
+        to be read into one bytes object and then handed to zipfile, so a single
+        upload cost twice its size in memory and a handful of concurrent ones
+        could exhaust the container.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._send_json(400, {"error": "missing or empty body"})
+            return None
+        if length > limit:
+            self._send_json(413, {"error": "archive too large"})
+            return None
+
+        fd, name = tempfile.mkstemp(prefix=".broker-upload-")
+        path = Path(name)
+        remaining = length
+        try:
+            with os.fdopen(fd, "wb") as out:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(_STREAM_CHUNK, remaining))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    remaining -= len(chunk)
+        except OSError as exc:
+            path.unlink(missing_ok=True)
+            self._send_json(500, {"error": f"could not buffer request body: {exc}"})
+            return None
+        if remaining:
+            path.unlink(missing_ok=True)
+            self._send_json(400, {"error": "truncated request body"})
+            return None
+        return path
+
     def _get_state_file(self):
         query = parse_qs(urlparse(self.path).query)
         try:
@@ -1278,8 +1394,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         # Block while a save is being written so the caller never receives a
-        # half-written or stale file right after triggering a save.
-        _wait_for_save_idle(time.monotonic() + STATE_GET_WAIT)
+        # half-written or stale file right after triggering a save. A save that
+        # is still running at the deadline is reported rather than served: the
+        # file on disk is mid-flush and RomM must not store it as the state.
+        if not _wait_for_save_idle(time.monotonic() + STATE_GET_WAIT):
+            log.warning("state-file: save still in progress after %.1fs, refusing to serve", STATE_GET_WAIT)
+            self._send_json(409, {"error": "save still in progress", "slot": slot})
+            return
 
         state_path = _newest_state_for_slot(slot)
         if state_path is None:
@@ -1288,23 +1409,37 @@ class BrokerHandler(BaseHTTPRequestHandler):
         try:
             # Size first: reading then measuring would pull an oversized state
             # entirely into memory only to refuse it.
-            if state_path.stat().st_size > STATE_FILE_MAX_BYTES:
+            size = state_path.stat().st_size
+            if size > STATE_FILE_MAX_BYTES:
                 self._send_json(413, {"error": "state file exceeds size limit"})
                 return
-            content = state_path.read_bytes()
+            fh = state_path.open("rb")
         except OSError as exc:
             self._send_json(500, {"error": f"could not read state file: {exc}"})
             return
-        if len(content) > STATE_FILE_MAX_BYTES:
-            self._send_json(413, {"error": "state file exceeds size limit"})
-            return
+
+        # Streamed in chunks rather than read_bytes(): states run to hundreds of
+        # megabytes and this is a threaded server, so buffering whole files here
+        # multiplied the limit by however many callers were pulling at once.
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Content-Length", str(size))
         self.send_header("X-State-Filename", state_path.name)
         self.end_headers()
-        self.wfile.write(content)
-        log.info("state-file: served %s (%d bytes)", state_path.name, len(content))
+        sent = 0
+        with fh:
+            while sent < size:
+                chunk = fh.read(min(_STREAM_CHUNK, size - sent))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                sent += len(chunk)
+        if sent != size:
+            # The body is already short; the connection is the only signal left.
+            log.error("state-file: %s shrank mid-send (%d of %d bytes)", state_path.name, sent, size)
+            self.close_connection = True
+            return
+        log.info("state-file: served %s (%d bytes)", state_path.name, sent)
 
     def _get_state_screenshot(self):
         query = parse_qs(urlparse(self.path).query)
@@ -1321,7 +1456,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         # A save in flight is about to overwrite this slot's thumbnail; wait it
         # out so the caller never pairs a new state with the previous frame.
-        _wait_for_save_idle(time.monotonic() + STATE_GET_WAIT)
+        if not _wait_for_save_idle(time.monotonic() + STATE_GET_WAIT):
+            log.warning("state-screenshot: save still in progress after %.1fs, refusing to serve", STATE_GET_WAIT)
+            self._send_json(409, {"error": "save still in progress", "slot": slot})
+            return
 
         path = _state_shot_path(slot)
         try:
@@ -1374,21 +1512,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
         log.info("save-file: served archive (%d bytes)", len(archive))
 
     def _put_save_file(self):
+        spooled = self._spool_body(SAVE_FILE_MAX_BYTES)
+        if spooled is None:
+            return
         try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            length = 0
-        if length <= 0:
-            self._send_json(400, {"error": "missing or empty body"})
-            return
-        if length > SAVE_FILE_MAX_BYTES:
-            self._send_json(413, {"error": "archive too large"})
-            return
-        content = self.rfile.read(length)
-        if len(content) != length:
-            self._send_json(400, {"error": "truncated request body"})
-            return
-        result = _extract_save_archive(content)
+            result = _extract_save_archive(spooled)
+        finally:
+            spooled.unlink(missing_ok=True)
         if isinstance(result, str):
             self._send_json(400, {"error": result})
             return
@@ -1420,21 +1550,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
         log.info("memory-card: served slot-A card (%d bytes)", len(result))
 
     def _put_memory_card(self):
+        spooled = self._spool_body(SAVE_FILE_MAX_BYTES)
+        if spooled is None:
+            return
         try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            length = 0
-        if length <= 0:
-            self._send_json(400, {"error": "missing or empty body"})
-            return
-        if length > SAVE_FILE_MAX_BYTES:
-            self._send_json(413, {"error": "archive too large"})
-            return
-        content = self.rfile.read(length)
-        if len(content) != length:
-            self._send_json(400, {"error": "truncated request body"})
-            return
-        result = _replace_memory_card(content)
+            result = _replace_memory_card(spooled)
+        finally:
+            spooled.unlink(missing_ok=True)
         if isinstance(result, str):
             self._send_json(400, {"error": result})
             return
@@ -1471,6 +1593,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
         ):
             self._send_json(400, {"error": "filename must be a <GameID>.sNN basename"})
             return
+        # The slot in the name is bounded here too. Accepting any .sNN let a
+        # caller write .s99, a slot no other route will read back or overwrite.
+        if not (1 <= int(ext[1:]) <= MAX_SLOT):
+            self._send_json(400, {"error": f"filename slot must be 01-{MAX_SLOT:02d}"})
+            return
 
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -1482,16 +1609,25 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if length > STATE_FILE_MAX_BYTES:
             self._send_json(413, {"error": "state file exceeds size limit"})
             return
-        content = self.rfile.read(length)
-        if len(content) != length:
-            self._send_json(400, {"error": "truncated request body"})
-            return
-
         state_dir = _sstate_dir() or _SSTATE_DIR_CANDIDATES[0]
         tmp = state_dir / f".{filename}.tmp"
+        remaining = length
         try:
             state_dir.mkdir(parents=True, exist_ok=True)
-            tmp.write_bytes(content)
+            # Streamed straight into the temp file: a state is up to
+            # STATE_FILE_MAX_BYTES and buffering it whole put that much per
+            # concurrent upload on the heap before anything touched disk.
+            with tmp.open("wb") as out:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(_STREAM_CHUNK, remaining))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    remaining -= len(chunk)
+            if remaining:
+                tmp.unlink(missing_ok=True)
+                self._send_json(400, {"error": "truncated request body"})
+                return
             # Dolphin runs as abc and must be able to overwrite the slot later.
             os.chown(tmp, _LOG_UID, _LOG_GID)
             os.replace(tmp, state_dir / filename)
@@ -1672,6 +1808,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if _session["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
                     return
+                # Loading mid-save races the save it would overwrite, the same
+                # way every other slot route does; this one used to skip the
+                # check and could roll the player back onto a stale state.
+                if _session["save_in_progress"]:
+                    self._send_json(409, {"error": "save already in progress"})
+                    return
             body = self._read_body()
             if body is None:
                 return
@@ -1787,14 +1929,15 @@ def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
     log.info("Received signal %d, beginning graceful shutdown", signum)
     Thread(target=server.shutdown, daemon=True).start()
 
-    deadline = time.monotonic() + max(SSTATE_WAIT, 5.0)
+    grace = max(SSTATE_WAIT, 5.0)
+    deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         with _session_lock:
             if not _session["save_in_progress"]:
                 break
         time.sleep(0.2)
     else:
-        log.warning("Shutdown: in-flight save did not complete within %.1fs, killing Dolphin anyway", SSTATE_WAIT)
+        log.warning("Shutdown: in-flight save did not complete within %.1fs, killing Dolphin anyway", grace)
 
     _kill_dolphin()
     log.info("Shutdown complete")
@@ -1812,6 +1955,11 @@ def main():
     if result.returncode == 0:
         log.info("Killed stale dolphin-emu instance(s) on startup.")
         _wait_dolphin_gone()
+
+    # Before _patch_ini: the ini pins GCIFolderAPathOverride at the card path,
+    # and a card left stranded by an interrupted swap should be back in place
+    # before Dolphin is ever pointed at it.
+    _recover_memory_card()
 
     _patch_ini()
 
