@@ -74,10 +74,10 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 | `DELETE` | `/launch` | Return to Dolphin dashboard |
 | `POST` | `/save-and-exit` | Save then stop game (`{"slot": N, "wait": true}`, `0` or omitted = `SAVE_SLOT`) |
 | `POST` | `/save-state` | Save state in background (`{"slot": N}`, `0` or omitted = `SAVE_SLOT`) |
-| `POST` | `/load-state` | Load a state (`{"slot": N}`, `0` or omitted = `SAVE_SLOT`) |
-| `GET` | `/state-file?slot=N` | Newest state file for slot N as raw bytes; the filename is echoed in the `X-State-Filename` header. Blocks while a save is in flight (up to `STATE_GET_WAIT`) so a GET after `/save-state` carries the finished write. `slot=0` resolves to `SAVE_SLOT`; returns `404` if the slot has no state. |
-| `PUT` | `/state-file?filename=NAME` | Write raw body into StateSaves as `NAME` (used by RomM to hydrate a claimed container). `NAME` must be a bare `<GameID>.sNN` basename; write is atomic and chowned to `abc`. Max 256 MB. |
-| `GET` | `/state-screenshot?slot=N` | PNG frame captured at the moment slot N was saved, used by RomM as the state's thumbnail. `404` if the slot has no capture. |
+| `POST` | `/load-state` | Load a state (`{"slot": N}`, `0` or omitted = `SAVE_SLOT`). `409` while a save is in flight, so a load never races the write it would overwrite. |
+| `GET` | `/state-file?slot=N` | Newest state file for slot N as raw bytes; the filename is echoed in the `X-State-Filename` header. Blocks while a save is in flight (up to `STATE_GET_WAIT`) so a GET after `/save-state` carries the finished write. `slot=0` resolves to `SAVE_SLOT`; returns `404` if the slot has no state, and `409` if the save is still running when `STATE_GET_WAIT` expires (the file on disk is mid-flush and must not be stored as the state). |
+| `PUT` | `/state-file?filename=NAME` | Write raw body into StateSaves as `NAME` (used by RomM to hydrate a claimed container). `NAME` must be a bare `<GameID>.sNN` basename with `NN` in `01`-`08`; write is atomic and chowned to `abc`. Max 256 MB. |
+| `GET` | `/state-screenshot?slot=N` | PNG frame captured at the moment slot N was saved, used by RomM as the state's thumbnail. `404` if the slot has no capture, `409` if a save is still in flight after `STATE_GET_WAIT`. |
 | `GET` | `/save-file` | Zip of every in-game save (GC cards, Wii NAND titles) modified since the last game launch. `404` with `X-Save-File: unchanged` when nothing changed, or `X-Save-File: absent` when no game has been launched. An untagged `404` means the endpoint is missing, not that there is nothing to sync. |
 | `PUT` | `/save-file` | Restore a pulled save archive. Files newer in the container than in the archive are skipped. Max 256 MB. |
 | `GET` | `/memory-card` | Zip of the whole Slot-A GCI folder card, member paths relative to the card root. `404` with `X-Memory-Card: absent` when no card exists yet. |
@@ -132,6 +132,7 @@ Dolphin supports 8 save state slots. RomM offers no slot selection, so **all sta
 | `SAVE_SLOT` | `8` | The one slot every state save and load uses (1-8) |
 | `SSTATE_WAIT` | `3.0` | Seconds to wait after save key before killing Dolphin |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` blocks waiting for an in-flight save to finish |
+| `BROKER_SPOOL_DIR` | `/config/.romm-broker-spool` | Where uploads are spooled to disk; falls back to the system temp dir if it cannot be created |
 | `DISPLAY_WAIT` | `30.0` | Max seconds to wait for the X server socket before starting anyway |
 | `SCREENSHOT_WAIT` | `5.0` | Max seconds to wait for the screenshot hotkey to produce a PNG before giving up on the state thumbnail |
 | `GCI_CARD_DIR` | _(derived)_ | Slot-A GCI folder card path; defaults to `romm/Card A` under Dolphin's data dir |

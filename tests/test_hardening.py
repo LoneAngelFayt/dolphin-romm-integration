@@ -8,12 +8,13 @@ their saves, so each one is pinned to the specific failure it prevents.
 import io
 import os
 import tempfile
+import time
 import unittest
 import unittest.mock
 import zipfile
 from pathlib import Path
 
-from support import broker, make_zip, write
+from support import broker, make_zip, reset_session, write
 
 
 def lying_zip(name: str, payload: bytes, claimed: int) -> bytes:
@@ -161,6 +162,14 @@ class SaveIdleWait(unittest.TestCase):
 class RelaunchCounter(unittest.TestCase):
     """The failure count is committed before the backoff sleep, not after."""
 
+    def setUp(self):
+        reset_session()
+
+    def tearDown(self):
+        # In tearDown, not at the end of the test body: restoring inline meant a
+        # single failed assertion leaked is_managed=True into every test after it.
+        reset_session()
+
     def test_the_count_is_visible_while_the_backoff_is_still_sleeping(self):
         # A second monitor thread waking during the sleep used to read the old
         # value, so two crash loops each counted from zero and neither gave up.
@@ -174,7 +183,8 @@ class RelaunchCounter(unittest.TestCase):
                 return 0
 
         proc = FakeProc()
-        broker._session.update(process=proc, is_managed=True, relaunch_failures=0)
+        with broker._session_lock:
+            broker._session.update(process=proc, is_managed=True, relaunch_failures=0)
 
         def record_sleep(_seconds):
             with broker._session_lock:
@@ -185,7 +195,204 @@ class RelaunchCounter(unittest.TestCase):
                 broker._monitor_process(proc, broker.time.monotonic() - 0.1)
 
         self.assertEqual(seen, [1])
-        broker._session.update(process=None, is_managed=False, relaunch_failures=0)
+
+
+class UnreadableMembers(unittest.TestCase):
+    """A member this Python cannot decode is the archive's fault, not ours."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name, "dolphin-emu")
+        self.root.mkdir()
+        self.env = unittest.mock.patch.dict(
+            "os.environ", {"SAVE_DATA_ROOT": str(self.root)}
+        )
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def encrypted(self) -> bytes:
+        """A zip claiming its member is encrypted, by flipping the header bit."""
+        raw = bytearray(make_zip({"GC/a.gci": b"hello"}))
+        for sig, offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+            at = raw.index(sig)
+            raw[at + offset] |= 0x01
+        return bytes(raw)
+
+    def test_an_encrypted_member_is_a_rejection_not_a_crash(self):
+        # zipfile raises RuntimeError here, which used to escape the handler as
+        # a 500 and leave the staged files on disk.
+        result = broker._extract_save_archive(self.encrypted())
+        self.assertIsInstance(result, str)
+        self.assertIn("unreadable", result)
+
+    def test_an_unsupported_compression_method_is_a_rejection(self):
+        archive = make_zip({"GC/a.gci": b"x"})
+        real_open = zipfile.ZipFile.open
+
+        def unsupported(self, member, mode="r", *args, **kwargs):
+            if mode == "r":
+                raise NotImplementedError("That compression method is not supported")
+            return real_open(self, member, mode, *args, **kwargs)
+
+        with unittest.mock.patch.object(zipfile.ZipFile, "open", unsupported):
+            result = broker._extract_save_archive(archive)
+        self.assertIsInstance(result, str)
+        self.assertIn("unreadable", result)
+
+    def test_a_rejected_archive_leaves_nothing_staged(self):
+        broker._extract_save_archive(self.encrypted())
+        self.assertFalse((self.root / broker.RESTORE_STAGING_DIR).exists())
+
+
+class RestoreStaging(unittest.TestCase):
+    """Staging lives beside the save subtrees, never inside them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name, "dolphin-emu")
+        self.root.mkdir()
+        self.env = unittest.mock.patch.dict(
+            "os.environ", {"SAVE_DATA_ROOT": str(self.root)}
+        )
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_the_staging_dir_is_outside_every_synced_subtree(self):
+        for sub in broker.SAVE_SYNC_SUBTREES:
+            self.assertFalse(
+                broker.RESTORE_STAGING_DIR.startswith(sub.split("/")[0]),
+                broker.RESTORE_STAGING_DIR,
+            )
+
+    def test_a_successful_restore_leaves_no_staging_dir(self):
+        broker._extract_save_archive(make_zip({"GC/a.gci": b"one"}))
+        self.assertEqual((self.root / "GC" / "a.gci").read_bytes(), b"one")
+        self.assertFalse((self.root / broker.RESTORE_STAGING_DIR).exists())
+
+    def test_leftover_staging_is_never_shipped_back_to_romm(self):
+        # A crash mid-restore used to leave .gci.tmp files among the saves,
+        # where the next GET /save-file zipped them up and sent them onward.
+        stale = self.root / broker.RESTORE_STAGING_DIR / "000000"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"half a save")
+        write(self.root / "GC" / "real.gci", b"real")
+        names = {p.name for p in broker._iter_save_files(self.root)}
+        self.assertEqual(names, {"real.gci"})
+
+    def slow_extraction(self, seconds=0.05):
+        """Widen the window between staging a member and committing it."""
+        real = broker._extract_member
+
+        def slow(zf, info, dest, budget):
+            time.sleep(seconds)
+            return real(zf, info, dest, budget)
+
+        return unittest.mock.patch.object(broker, "_extract_member", slow)
+
+    def test_two_real_restores_do_not_eat_each_other(self):
+        # Both stage into the same directory and wipe it on entry, so the
+        # second restore used to delete the first one's staged members and
+        # then rename paths that were no longer there.
+        from threading import Thread
+
+        results = {}
+
+        def restore(name, payload):
+            results[name] = broker._extract_save_archive(make_zip({name: payload}))
+
+        with self.slow_extraction():
+            threads = [
+                Thread(target=restore, args=(f"GC/{n}.gci", n.encode() * 8))
+                for n in ("a", "b", "c")
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+
+        for name, result in results.items():
+            self.assertIsInstance(result, tuple, f"{name}: {result}")
+        for n in ("a", "b", "c"):
+            self.assertEqual((self.root / "GC" / f"{n}.gci").read_bytes(), n.encode() * 8)
+
+    def test_a_get_never_zips_a_tree_mid_restore(self):
+        # The archive RomM pulls has to be all of the restore or none of it,
+        # never the half of it that had been renamed into place so far.
+        from threading import Thread
+
+        members = {f"GC/{n}.gci": b"restored" for n in ("a", "b", "c")}
+        archives = []
+
+        def restore():
+            broker._extract_save_archive(make_zip(members))
+
+        with self.slow_extraction():
+            worker = Thread(target=restore)
+            worker.start()
+            time.sleep(0.02)
+            archives.append(broker._build_save_archive(0))
+            worker.join(timeout=10)
+
+        with zipfile.ZipFile(io.BytesIO(archives[0])) as zf:
+            self.assertEqual({i.filename for i in zf.infolist()}, set(members))
+
+    def test_a_staging_dir_that_cannot_be_made_names_itself_in_the_error(self):
+        with unittest.mock.patch.object(
+            broker, "_mkdirs_owned", side_effect=OSError("read-only file system")
+        ):
+            error = broker._extract_save_archive(make_zip({"GC/a.gci": b"one"}))
+        self.assertIn(broker.RESTORE_STAGING_DIR, error)
+
+
+class Spool(unittest.TestCase):
+    """Uploads are buffered on the mounted volume, not in the system temp dir."""
+
+    def test_the_spool_dir_is_created_and_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp, "spool")
+            with unittest.mock.patch.dict(
+                "os.environ", {"BROKER_SPOOL_DIR": str(target)}
+            ):
+                self.assertEqual(broker._spool_dir(), str(target))
+            self.assertTrue(target.is_dir())
+
+    def test_an_unusable_spool_dir_falls_back_to_the_system_default(self):
+        with unittest.mock.patch.dict(
+            "os.environ", {"BROKER_SPOOL_DIR": "/proc/nope/spool"}
+        ):
+            self.assertIsNone(broker._spool_dir())
+
+    def test_stale_uploads_are_cleared_at_boot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.dict("os.environ", {"BROKER_SPOOL_DIR": tmp}):
+                stale = Path(tmp, ".broker-upload-abc123")
+                stale.write_bytes(b"half an archive")
+                keep = Path(tmp, "unrelated")
+                keep.write_bytes(b"x")
+                broker._clear_spool()
+                self.assertFalse(stale.exists())
+                self.assertTrue(keep.exists())
+
+    def test_the_fallback_location_is_cleared_too(self):
+        # An unusable /config is exactly when clearing matters: every upload
+        # has been landing in the system temp dir, which nothing else prunes.
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = Path(tmp, ".broker-upload-def456")
+            stale.write_bytes(b"half an archive")
+            with unittest.mock.patch.dict(
+                "os.environ", {"BROKER_SPOOL_DIR": "/proc/nope/spool"}
+            ):
+                with unittest.mock.patch.object(
+                    broker.tempfile, "gettempdir", lambda: tmp
+                ):
+                    broker._clear_spool()
+            self.assertFalse(stale.exists())
 
 
 if __name__ == "__main__":

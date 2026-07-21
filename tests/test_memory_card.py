@@ -99,16 +99,17 @@ class ReplaceMemoryCard(MemoryCardBase):
     def test_the_card_survives_a_failure_partway_through_extraction(self):
         write(self.card / "GALE01.gci", b"precious")
         archive = make_zip({"a.gci": b"1", "b.gci": b"2"})
-        real_write_bytes = Path.write_bytes
+        real_open = Path.open
         calls = {"n": 0}
 
-        def flaky(self, data):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                raise OSError("disk full")
-            return real_write_bytes(self, data)
+        def flaky(self, mode="r", *args, **kwargs):
+            if "w" in mode:
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise OSError("disk full")
+            return real_open(self, mode, *args, **kwargs)
 
-        with unittest.mock.patch.object(Path, "write_bytes", flaky):
+        with unittest.mock.patch.object(Path, "open", flaky):
             self.assertIsInstance(broker._replace_memory_card(archive), str)
         self.assertEqual((self.card / "GALE01.gci").read_bytes(), b"precious")
 

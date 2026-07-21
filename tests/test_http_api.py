@@ -5,8 +5,10 @@ helper stubbed, so this covers routing, auth, validation and status codes.
 """
 
 import json
+import sys
 import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
 import urllib.error
@@ -382,6 +384,38 @@ class StateFileTransfer(ApiTestCase):
             ):
                 resp = self.request("GET", "/state-file?slot=8")
         self.assertEqual(resp.status, 413)
+
+    def test_a_client_that_hangs_up_mid_pull_does_not_break_the_server(self):
+        # The streamed write is unguarded no longer: a disconnect used to raise
+        # BrokenPipeError out of the handler as an unhandled traceback.
+        # Asserted on handle_error, not on the server still answering: the
+        # server survives an unhandled exception either way, so a /health probe
+        # passed just as well before the guard existed.
+        import socket
+        import struct
+
+        errors = []
+        self.server.handle_error = lambda request, addr: errors.append(
+            sys.exc_info()[1]
+        )
+        # 16 MB so the write is still in progress when the client vanishes, and
+        # SO_LINGER 0 so the close sends an RST rather than a polite FIN: a FIN
+        # alone lets the kernel keep buffering and the write never fails.
+        write(self.state_dir / "GALE01.s08", b"x" * (16 * 1024 * 1024))
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.sendall(
+            b"GET /state-file?slot=8 HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"X-Broker-Secret: " + self.SECRET.encode() + b"\r\n\r\n"
+        )
+        sock.recv(64)
+        sock.close()
+        self.assertEqual(self.request("GET", "/health", secret=None).status, 200)
+        # The handler runs on its own thread and hits the dead socket a moment
+        # after the close, so give it one before reading the error list.
+        time.sleep(0.5)
+        self.assertEqual(errors, [])
 
     def test_put_stores_the_file_under_its_original_name(self):
         resp = self.request(

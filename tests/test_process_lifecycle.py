@@ -95,6 +95,18 @@ class CrashRelaunch(unittest.TestCase):
         self.monitor(0.1)
         self.assertEqual(self.relaunches, 0)
 
+    def test_a_launch_during_the_backoff_is_not_stomped_on(self):
+        # The monitor sleeps up to a minute. A /launch landing in that window
+        # installs a new process, and a monitor that only rechecked is_managed
+        # went on to relaunch the dashboard over the game just started.
+        def launch_lands(_seconds):
+            with broker._session_lock:
+                broker._session["process"] = FakeProc(pid=777)
+
+        with unittest.mock.patch.object(broker.time, "sleep", launch_lands):
+            self.monitor(0.1)
+        self.assertEqual(self.relaunches, 0)
+
     def test_a_superseded_process_is_not_relaunched(self):
         with broker._session_lock:
             broker._session["process"] = FakeProc(pid=9999)

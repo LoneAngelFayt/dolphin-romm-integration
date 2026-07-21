@@ -19,6 +19,7 @@ dir through the `SSTATE_DIR`, `SAVE_DATA_ROOT` and `GCI_CARD_DIR` overrides.
 | `test_memory_card.py` | `/memory-card`: whole-card replace, staging swap, survival of a failed hydrate |
 | `test_state_files.py` | Savestate discovery and the write-confirmation poll |
 | `test_http_api.py` | Live server: routing, auth, slot validation, status codes, round trips |
+| `test_hardening.py` | Zip bombs, planted symlinks, unreadable members, spooling, interrupted card swaps |
 | `test_process_lifecycle.py` | Crash-relaunch backoff and cap, launch serialisation, the display wait |
 | `test_packaging.py` | s6 wiring, sudoers coverage, and drift between `init.sh` and `broker.py` |
 

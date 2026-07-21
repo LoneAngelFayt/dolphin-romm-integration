@@ -112,6 +112,11 @@ _launch_lock = Lock()
 # Serialises card hydration. The staging and backup dirs were named after the
 # pid, which is the same pid for every thread of this server.
 _memory_card_lock = Lock()
+# Guards the save tree. Every restore stages into the same directory and wipes
+# it on entry, so two concurrent PUT /save-file deleted each other's staged
+# members and then renamed paths that were no longer there. GET /save-file
+# takes it too, or it zips a tree caught halfway through a restore's renames.
+_save_file_lock = Lock()
 _session: dict = {
     "process":          None,
     "rom_path":         None,
@@ -483,7 +488,11 @@ def _monitor_process(proc, start_time):
     time.sleep(wait_time)
 
     with _session_lock:
-        if not _session["is_managed"]:
+        # The process check is repeated, not just is_managed: a /launch landing
+        # during a backoff sleep installs a new process, and a monitor that only
+        # rechecked the flag went on to relaunch the dashboard over the game the
+        # user had just started.
+        if not (_session["is_managed"] and _session["process"] is proc):
             return
 
     _launch_dolphin(None)
@@ -740,6 +749,40 @@ STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
 # Transfers move through the socket and the filesystem in chunks this size, so
 # a request costs a fixed amount of memory instead of its whole payload.
 _STREAM_CHUNK = 1024 * 1024
+# Where uploads are spooled. Under /config, the mounted volume, rather than the
+# system temp dir: /tmp in this image holds the selkies sockets and is sized for
+# nothing, and a 256 MB upload landing there fills it out from under the stream.
+SPOOL_DIR_DEFAULT = "/config/.romm-broker-spool"
+
+
+def _spool_dir() -> str | None:
+    """The spool dir if it can be created, else None for the system default."""
+    path = Path(os.environ.get("BROKER_SPOOL_DIR", SPOOL_DIR_DEFAULT))
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+    except OSError as exc:
+        log.warning("spool: cannot use %s (%s), falling back to the system temp dir",
+                    path, exc)
+        return None
+
+
+def _clear_spool() -> None:
+    """Drop uploads left spooled by a previous run.
+
+    A container killed mid-PUT leaves a partial archive behind; nothing reads
+    them back, so they are dead weight on the user's volume until removed.
+    """
+    # The fallback location is swept too. That is the case where clearing
+    # matters most: an unusable /config means every upload has been landing in
+    # the system temp dir, where nothing else prunes them either.
+    directory = _spool_dir() or tempfile.gettempdir()
+    for stale in Path(directory).glob(".broker-upload-*"):
+        try:
+            stale.unlink()
+            log.info("spool: removed stale upload %s", stale.name)
+        except OSError:
+            pass
 
 
 def _wait_for_save_idle(deadline: float) -> bool:
@@ -884,6 +927,10 @@ def _restart_selkies():
 # one that has, so the two paths never both carry the card.
 SAVE_SYNC_SUBTREES = ("GC", "Wii/title", "romm/Card A")
 SAVE_FILE_MAX_BYTES = 256 * 1024 * 1024
+# Where a restore stages members before renaming them into place. Root-relative
+# and deliberately outside SAVE_SYNC_SUBTREES, so a staging dir left behind by
+# a crash is never picked up as a save and shipped back to RomM.
+RESTORE_STAGING_DIR = ".romm-restore"
 # Zip stores mtimes at 2 s DOS resolution; the slack keeps the newer-file
 # guard from skipping files over rounding alone.
 _SAVE_MTIME_SLACK = 2.0
@@ -933,23 +980,44 @@ def _open_archive(source: bytes | Path) -> zipfile.ZipFile:
     return zipfile.ZipFile(io.BytesIO(source) if isinstance(source, bytes) else source)
 
 
-def _read_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, budget: int) -> bytes:
-    """Decompress one member, refusing to produce more than `budget` bytes.
+def _extract_member(
+    zf: zipfile.ZipFile, info: zipfile.ZipInfo, dest: Path, budget: int
+) -> int:
+    """Decompress one member into `dest`, writing at most `budget` bytes.
 
     info.file_size is the archive's own claim about the member and a crafted
     zip can understate it by orders of magnitude, so the declared-size total is
-    only a cheap first pass: the actual read is capped and checked. Raises
-    ValueError when the member overruns or when the member itself is corrupt,
-    so one bad entry is reported as a rejected archive and not as a 500.
+    only a cheap first pass: the actual write is capped and checked.
+
+    Copied a chunk at a time rather than read() into one buffer: a member is
+    allowed to be as large as the whole archive limit, and holding that on the
+    heap would undo the spooling the request body already went through.
+
+    Raises ValueError for anything the archive itself is responsible for (an
+    overrun, a corrupt member, an encrypted one, a compression method this
+    Python cannot decode) so a bad upload is a rejected archive and not a 500.
     """
+    written = 0
     try:
-        with zf.open(info) as fh:
-            data = fh.read(budget + 1)
-    except zipfile.BadZipFile as exc:
-        raise ValueError(f"archive member {info.filename} is corrupt: {exc}") from exc
-    if len(data) > budget:
-        raise ValueError(f"archive member {info.filename} exceeds the size limit")
-    return data
+        with zf.open(info) as src, dest.open("wb") as out:
+            while True:
+                chunk = src.read(min(_STREAM_CHUNK, budget - written + 1))
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > budget:
+                    # ValueError, deliberately: it passes through the except
+                    # clause below untouched and reaches the caller as is.
+                    raise ValueError(
+                        f"archive member {info.filename} exceeds the size limit"
+                    )
+                out.write(chunk)
+    except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError) as exc:
+        # RuntimeError is what zipfile raises for an encrypted member and
+        # NotImplementedError for a compression method it cannot decode;
+        # neither is a bug in the broker.
+        raise ValueError(f"archive member {info.filename} is unreadable: {exc}") from exc
+    return written
 
 
 def _build_save_archive(baseline: float) -> bytes | None:
@@ -957,7 +1025,16 @@ def _build_save_archive(baseline: float) -> bytes | None:
 
     Returns None when there is nothing to sync: no data dir yet, or no file
     changed since `baseline`. Member paths are relative to the data dir so a
-    later PUT restores them regardless of which candidate dir is live."""
+    later PUT restores them regardless of which candidate dir is live.
+
+    Holds the save tree lock: a GET landing during a restore's rename loop used
+    to zip a tree that was half old and half new and ship that mixture to RomM
+    as if it were one coherent snapshot."""
+    with _save_file_lock:
+        return _build_save_archive_locked(baseline)
+
+
+def _build_save_archive_locked(baseline: float) -> bytes | None:
     root = _save_data_root()
     if root is None:
         log.debug("save-file: no Dolphin data dir found")
@@ -1004,15 +1081,26 @@ def _mkdirs_owned(path: Path) -> None:
 
 
 def _extract_save_archive(source: bytes | Path) -> tuple[int, int] | str:
+    """Restore a pulled save archive, one restore at a time."""
+    with _save_file_lock:
+        return _extract_save_archive_locked(source)
+
+
+def _extract_save_archive_locked(source: bytes | Path) -> tuple[int, int] | str:
     """Restore a pulled save archive into the data dir.
 
     Returns (written, skipped) on success, or an error string for a bad
     archive. Existing files newer than their archive member are skipped so a
     restore can never roll back saves made since the archive was taken.
 
-    Every member is written to a temp file first and only renamed into place
-    once all of them are on disk: a failure partway through used to leave the
-    save tree half restored, with no record of which half."""
+    Every member is written into a staging dir first and only renamed into
+    place once all of them are on disk: a failure partway through used to leave
+    the save tree half restored, with no record of which half.
+
+    The staging dir sits beside the save subtrees, not inside them. Staging in
+    the live tree meant a crash mid-restore left dotfile temps among the user's
+    saves, where the next GET /save-file happily zipped them up and shipped
+    them to RomM."""
     root = _save_data_root() or _SAVE_DATA_ROOTS[0]
     try:
         zf = _open_archive(source)
@@ -1032,10 +1120,23 @@ def _extract_save_archive(source: bytes | Path) -> tuple[int, int] | str:
             ):
                 return f"archive member outside save subtrees: {info.filename}"
 
+        staging = root / RESTORE_STAGING_DIR
+        shutil.rmtree(staging, ignore_errors=True)
         staged: list[tuple[Path, Path, float]] = []
         skipped = 0
+        # Its own try: a staging dir that cannot be made is not a member
+        # failure, and reporting it as one named a file the archive never had.
         try:
-            for info in infos:
+            _mkdirs_owned(staging)
+        except OSError as exc:
+            return f"could not create the staging dir {staging.name}: {exc}"
+
+        failed = None
+        try:
+            for index, info in enumerate(infos):
+                # Set before the skip check, not after: a stat that fails on
+                # the target still has to name the member it was checking.
+                failed = info.filename
                 target = root / PurePosixPath(info.filename)
                 mtime = time.mktime(info.date_time + (0, 0, -1))
                 if (
@@ -1044,20 +1145,16 @@ def _extract_save_archive(source: bytes | Path) -> tuple[int, int] | str:
                 ):
                     skipped += 1
                     continue
-                data = _read_member(zf, info, budget)
-                budget -= len(data)
-                _mkdirs_owned(target.parent)
-                tmp = target.parent / f".{target.name}.tmp"
-                tmp.write_bytes(data)
+                # Flat, index-named: member paths are arbitrarily nested and
+                # only the rename below decides where a file ends up.
+                tmp = staging / f"{index:06d}"
+                budget -= _extract_member(zf, info, tmp, budget)
                 os.chown(tmp, _LOG_UID, _LOG_GID)
+                _mkdirs_owned(target.parent)
                 staged.append((tmp, target, mtime))
         except (OSError, ValueError) as exc:
-            for tmp, _target, _mtime in staged:
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-            return f"could not write {info.filename}: {exc}"
+            shutil.rmtree(staging, ignore_errors=True)
+            return f"could not restore {failed}: {exc}"
 
         for tmp, target, mtime in staged:
             try:
@@ -1067,7 +1164,9 @@ def _extract_save_archive(source: bytes | Path) -> tuple[int, int] | str:
                 # Past the point of no return: some files are already live.
                 # Report it rather than pretending the restore was clean.
                 log.error("save-file: could not commit %s: %s", target, exc)
+                shutil.rmtree(staging, ignore_errors=True)
                 return f"could not write {target.name}: {exc}"
+        shutil.rmtree(staging, ignore_errors=True)
     return (len(staged), skipped)
 
 
@@ -1256,14 +1355,13 @@ def _replace_memory_card_locked(source: bytes | Path) -> tuple[int] | str:
             _mkdirs_owned(staging)
             written = 0
             for info in infos:
+                # Written straight to its final name: the whole staging dir is
+                # discarded on failure, so a half-written member inside it can
+                # never be mistaken for part of the live card.
                 target = staging / PurePosixPath(info.filename)
-                data = _read_member(zf, info, budget)
-                budget -= len(data)
                 _mkdirs_owned(target.parent)
-                tmp = target.parent / f".{target.name}.tmp"
-                tmp.write_bytes(data)
-                os.chown(tmp, _LOG_UID, _LOG_GID)
-                os.replace(tmp, target)
+                budget -= _extract_member(zf, info, target, budget)
+                os.chown(target, _LOG_UID, _LOG_GID)
                 written += 1
             # Swap staging over the live card: move the old card aside, move the
             # new one into place, then drop the old. Both live under the same
@@ -1359,7 +1457,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(413, {"error": "archive too large"})
             return None
 
-        fd, name = tempfile.mkstemp(prefix=".broker-upload-")
+        fd, name = tempfile.mkstemp(prefix=".broker-upload-", dir=_spool_dir())
         path = Path(name)
         remaining = length
         try:
@@ -1427,13 +1525,20 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_header("X-State-Filename", state_path.name)
         self.end_headers()
         sent = 0
-        with fh:
-            while sent < size:
-                chunk = fh.read(min(_STREAM_CHUNK, size - sent))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                sent += len(chunk)
+        try:
+            with fh:
+                while sent < size:
+                    chunk = fh.read(min(_STREAM_CHUNK, size - sent))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            # RomM hung up mid-pull. Nothing to report to a socket that is
+            # already gone, and it is not an error worth a traceback.
+            log.info("state-file: client disconnected after %d of %d bytes", sent, size)
+            self.close_connection = True
+            return
         if sent != size:
             # The body is already short; the connection is the only signal left.
             log.error("state-file: %s shrank mid-send (%d of %d bytes)", state_path.name, sent, size)
@@ -1960,6 +2065,7 @@ def main():
     # and a card left stranded by an interrupted swap should be back in place
     # before Dolphin is ever pointed at it.
     _recover_memory_card()
+    _clear_spool()
 
     _patch_ini()
 
