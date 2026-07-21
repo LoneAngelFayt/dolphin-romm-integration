@@ -24,10 +24,15 @@ from urllib.parse import parse_qs, urlparse
 PORT       = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET     = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
-SAVE_SLOT     = int(os.environ.get("SAVE_SLOT", "1"))  # default slot for manual save-and-exit (1–7)
-AUTOSAVE_SLOT = 8                                       # slot 8 is reserved exclusively for auto-saves
-if not (1 <= SAVE_SLOT <= 7):
-    raise SystemExit(f"SAVE_SLOT must be 1–7, got {SAVE_SLOT}")
+MAX_SLOT      = 8                                       # Dolphin maps F1–F8 / Shift+F1–F8 to slots 1–8
+# Every state write — manual save, save-and-exit, auto-save on navigate-away —
+# goes through this one slot, and every read defaults to it. RomM does not
+# offer slot selection, so a second "autosave" slot would only split the
+# library's view of a session across two files. Overridable for debugging.
+SAVE_SLOT     = int(os.environ.get("SAVE_SLOT", str(MAX_SLOT)))
+AUTOSAVE_SLOT = SAVE_SLOT                               # kept as an alias for /config consumers
+if not (1 <= SAVE_SLOT <= MAX_SLOT):
+    raise SystemExit(f"SAVE_SLOT must be 1–{MAX_SLOT}, got {SAVE_SLOT}")
 # Max seconds to poll for the savestate write to complete after the save key.
 # Returns as soon as the file size is stable, so raising this only affects the
 # failure path. Falls back to a fixed 3 s sleep if the StateSaves dir is absent.
@@ -476,12 +481,12 @@ def _launch_dolphin_inner(rom_path, state_path=None):
 
     if do_autosave:
         try:
-            ok = _xdotool_save_state(AUTOSAVE_SLOT)
+            ok = _xdotool_save_state(SAVE_SLOT)
             if ok:
                 log.info("auto-save: saved to slot %d before leaving %s",
-                         AUTOSAVE_SLOT, Path(old_game).name)
+                         SAVE_SLOT, Path(old_game).name)
             else:
-                log.warning("auto-save: xdotool failed for slot %d — continuing anyway", AUTOSAVE_SLOT)
+                log.warning("auto-save: xdotool failed for slot %d — continuing anyway", SAVE_SLOT)
         finally:
             with _session_lock:
                 _session["save_in_progress"] = False
@@ -1148,8 +1153,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         if slot == 0:
             slot = SAVE_SLOT
-        if not (1 <= slot <= 8):
-            self._send_json(400, {"error": "slot must be 0–8"})
+        if not (1 <= slot <= MAX_SLOT):
+            self._send_json(400, {"error": f"slot must be 0–{MAX_SLOT}"})
             return
 
         # Block while a save is being written so the caller never receives a
@@ -1185,8 +1190,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         if slot == 0:
             slot = SAVE_SLOT
-        if not (1 <= slot <= AUTOSAVE_SLOT):
-            self._send_json(400, {"error": f"slot must be 0–{AUTOSAVE_SLOT}"})
+        if not (1 <= slot <= MAX_SLOT):
+            self._send_json(400, {"error": f"slot must be 0–{MAX_SLOT}"})
             return
 
         # A save in flight is about to overwrite this slot's thumbnail; wait it
@@ -1415,12 +1420,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 _session["save_in_progress"] = True
             body = self._read_body()
-            slot = body.get("slot", AUTOSAVE_SLOT)
-            if not isinstance(slot, int) or not (1 <= slot <= 8):
+            slot = body.get("slot", SAVE_SLOT)
+            if not isinstance(slot, int) or not (0 <= slot <= MAX_SLOT):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–8"})
+                self._send_json(400, {"error": f"slot must be 0–{MAX_SLOT}"})
                 return
+            # Slot 0 means "use the default slot", matching the pcsx2 broker.
+            if slot == 0:
+                slot = SAVE_SLOT
             wait = body.get("wait", True)
             if wait:
                 try:
@@ -1485,12 +1493,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 _session["save_in_progress"] = True
             body = self._read_body()
-            slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 7):
+            slot = body.get("slot", SAVE_SLOT)
+            if not isinstance(slot, int) or not (0 <= slot <= MAX_SLOT):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–7"})
+                self._send_json(400, {"error": f"slot must be 0–{MAX_SLOT}"})
                 return
+            # Slot 0 means "use the default slot", matching the pcsx2 broker.
+            if slot == 0:
+                slot = SAVE_SLOT
 
             def _bg_save(s):
                 try:
@@ -1511,10 +1522,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     self._send_json(409, {"error": "no game is running"})
                     return
             body = self._read_body()
-            slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 8):
-                self._send_json(400, {"error": "slot must be 1–8"})
+            slot = body.get("slot", SAVE_SLOT)
+            if not isinstance(slot, int) or not (0 <= slot <= MAX_SLOT):
+                self._send_json(400, {"error": f"slot must be 0–{MAX_SLOT}"})
                 return
+            # Slot 0 means "use the default slot", matching the pcsx2 broker.
+            if slot == 0:
+                slot = SAVE_SLOT
             ok = _xdotool_load_state(slot)
             self._send_json(200 if ok else 500, {"status": "ok" if ok else "error", "loaded": ok, "slot": slot})
             return
@@ -1549,9 +1563,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         # Resume-from-state: hand the state to Dolphin at boot.
         load_slot = body.get("load_slot")
         if load_slot is not None and (
-            not isinstance(load_slot, int) or not (1 <= load_slot <= 8)
+            not isinstance(load_slot, int) or not (1 <= load_slot <= MAX_SLOT)
         ):
-            self._send_json(400, {"error": "load_slot must be 1–8"})
+            self._send_json(400, {"error": f"load_slot must be 1–{MAX_SLOT}"})
             return
 
         # Same slot-to-file resolution GET /state-file uses. A resume is always

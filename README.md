@@ -12,7 +12,7 @@ An S6 service (`svc-broker`) runs `broker.py` as root inside the container. The 
 
 1. Kills any stale Dolphin process on startup, then launches Dolphin in dashboard mode.
 2. Accepts HTTP requests from the RomM backend to launch ROMs, save/load state, set volume, and stop sessions.
-3. Auto-saves to the reserved auto-save slot whenever a game is exited or switched.
+3. Auto-saves to `SAVE_SLOT` whenever a game is exited or switched.
 4. Monitors the Dolphin process and relaunches it into dashboard mode if it exits unexpectedly.
 
 ---
@@ -72,9 +72,9 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 | `GET` | `/status` | Current session info including slot config |
 | `POST` | `/launch` | Launch a ROM (`{"rom_path": "..."}`). Optional `"load_slot": N` (1–8) resumes from that state slot: the broker resolves the slot to its state file and passes it to Dolphin as `--save_state`, so the state is applied during boot, before emulation starts — the game is never seen running un-resumed. Returns `404` if the slot has no state file. Push the state file via `PUT /state-file` before launching. |
 | `DELETE` | `/launch` | Return to Dolphin dashboard |
-| `POST` | `/save-and-exit` | Save to auto-save slot then stop game (`{"slot": 8, "wait": true}`) |
-| `POST` | `/save-state` | Save to a user slot in background (`{"slot": 1}`) |
-| `POST` | `/load-state` | Load from a slot (`{"slot": 1}`) |
+| `POST` | `/save-and-exit` | Save then stop game (`{"slot": N, "wait": true}`, `0` or omitted = `SAVE_SLOT`) |
+| `POST` | `/save-state` | Save state in background (`{"slot": N}`, `0` or omitted = `SAVE_SLOT`) |
+| `POST` | `/load-state` | Load a state (`{"slot": N}`, `0` or omitted = `SAVE_SLOT`) |
 | `GET` | `/state-file?slot=N` | Newest state file for slot N as raw bytes; the filename is echoed in the `X-State-Filename` header. Blocks while a save is in flight (up to `STATE_GET_WAIT`) so a GET after `/save-state` carries the finished write. `slot=0` resolves to `SAVE_SLOT`; returns `404` if the slot has no state. |
 | `PUT` | `/state-file?filename=NAME` | Write raw body into StateSaves as `NAME` (used by RomM to hydrate a claimed container). `NAME` must be a bare `<GameID>.sNN` basename; write is atomic and chowned to `abc`. Max 256 MB. |
 | `GET` | `/state-screenshot?slot=N` | PNG frame captured at the moment slot N was saved, used by RomM as the state's thumbnail. `404` if the slot has no capture. |
@@ -111,14 +111,14 @@ frame. It is best effort throughout: a failed capture never fails the save.
 
 ### Save State Slots
 
-Dolphin supports 8 save state slots. **Slot 8 is reserved exclusively for auto-saves** and is not shown in the RomM slot selector.
+Dolphin supports 8 save state slots. RomM offers no slot selection, so **all state I/O funnels through a single slot — `SAVE_SLOT` (env, default 8)**, the same shape the pcsx2 broker uses. Splitting manual saves and auto-saves across two slots would only split the library's view of a session across two files.
 
-| Action | User slots | Auto-save slot | Hotkey |
-|--------|-----------|---------------|--------|
-| Save | 1–7 | 8 (auto only) | `Shift+F1` – `Shift+F8` |
-| Load | 1–7 | 8 (load autosave button) | `F1` – `F8` |
+| Action | Slot | Hotkey |
+|--------|------|--------|
+| Save | `SAVE_SLOT` (`0` or omitted resolves to it; `1`–`8` addressable) | `Shift+F1` – `Shift+F8` |
+| Load | `SAVE_SLOT` (`0` or omitted resolves to it; `1`–`8` addressable) | `F1` – `F8` |
 
-**Auto-save behaviour:** slot 8 is written automatically whenever you navigate away from a game (switch titles or click save-and-exit). The "load autosave" button in the RomM player always loads slot 8.
+`SAVE_SLOT` is written by manual saves, by save-and-exit, and automatically whenever you navigate away from a game (switch titles or click save-and-exit); every read defaults to it. The explicit `1`–`8` range stays addressable for debugging.
 
 ---
 
@@ -129,6 +129,7 @@ Dolphin supports 8 save state slots. **Slot 8 is reserved exclusively for auto-s
 | `BROKER_PORT` | `8000` | HTTP port the broker listens on |
 | `BROKER_SECRET` | _(empty)_ | Shared secret for request auth (`X-Broker-Secret` header) |
 | `ROM_ROOT` | `/romm/library` | ROM files must be within this path |
+| `SAVE_SLOT` | `8` | The one slot every state save and load uses (1–8) |
 | `SSTATE_WAIT` | `3.0` | Seconds to wait after save key before killing Dolphin |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` blocks waiting for an in-flight save to finish |
 | `SCREENSHOT_WAIT` | `5.0` | Max seconds to wait for the screenshot hotkey to produce a PNG before giving up on the state thumbnail |
