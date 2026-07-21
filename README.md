@@ -70,7 +70,7 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
 | `GET` | `/status` | Current session info including slot config |
-| `POST` | `/launch` | Launch a ROM (`{"rom_path": "..."}`). Optional `"load_slot": N` (1–8) resumes from that state slot: once the new game window is up (up to `RESUME_LOAD_WAIT`, plus a `RESUME_LOAD_SETTLE` grace) the broker sends the load hotkey. Push the state file via `PUT /state-file` before launching. |
+| `POST` | `/launch` | Launch a ROM (`{"rom_path": "..."}`). Optional `"load_slot": N` (1–8) resumes from that state slot: the broker resolves the slot to its state file and passes it to Dolphin as `--save_state`, so the state is applied during boot, before emulation starts — the game is never seen running un-resumed. Returns `404` if the slot has no state file. Push the state file via `PUT /state-file` before launching. |
 | `DELETE` | `/launch` | Return to Dolphin dashboard |
 | `POST` | `/save-and-exit` | Save to auto-save slot then stop game (`{"slot": 8, "wait": true}`) |
 | `POST` | `/save-state` | Save to a user slot in background (`{"slot": 1}`) |
@@ -131,8 +131,6 @@ Dolphin supports 8 save state slots. **Slot 8 is reserved exclusively for auto-s
 | `ROM_ROOT` | `/romm/library` | ROM files must be within this path |
 | `SSTATE_WAIT` | `3.0` | Seconds to wait after save key before killing Dolphin |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` blocks waiting for an in-flight save to finish |
-| `RESUME_LOAD_WAIT` | `90.0` | Max seconds a `load_slot` launch waits for the new game window before giving up on the deferred state load |
-| `RESUME_LOAD_SETTLE` | `8.0` | Seconds to let the game boot after its window appears, before the deferred `load_slot` hotkey fires |
 | `SCREENSHOT_WAIT` | `5.0` | Max seconds to wait for the screenshot hotkey to produce a PNG before giving up on the state thumbnail |
 | `GCI_CARD_DIR` | _(derived)_ | Slot-A GCI folder card path; defaults to `romm/Card A` under Dolphin's data dir |
 | `BROKER_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`) |
