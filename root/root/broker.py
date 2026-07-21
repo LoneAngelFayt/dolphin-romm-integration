@@ -608,21 +608,29 @@ def _sstate_snapshot(state_dir: Path) -> dict:
     return snap
 
 
-def _wait_for_sstate_write(state_dir: Path, before: dict, deadline: float) -> bool:
-    """Poll state_dir until a savestate write completes or deadline passes.
+def _wait_for_sstate_write(state_dir: Path, before: dict, deadline: float, slot: int) -> bool:
+    """Poll state_dir until the slot's savestate write completes or deadline passes.
 
     Detects new files and overwrites (mtime change), then waits for the size
     to be stable for 0.5 s. Killing Dolphin on a fixed timer instead of write
     confirmation truncates large states mid-flush.
+
+    Only files named for this slot (`<GameID>.s{slot:02d}`) count. Dolphin
+    writes its undo backup `lastState.sav` first and finishes it well before
+    the slot file, so watching whichever file changes first confirms the save
+    while the state itself is still flushing.
     """
     STABLE_SECS = 0.5
     POLL_SECS   = 0.1
+    suffix = f".s{slot:02d}"
     target = last_size = stable_since = None
 
     while time.monotonic() < deadline:
         after = _sstate_snapshot(state_dir)
         if target is None:
             for p, (size, mtime) in after.items():
+                if not p.name.endswith(suffix):
+                    continue
                 prev = before.get(p)
                 if prev is None or prev[1] != mtime:
                     target, last_size, stable_since = p, size, time.monotonic()
@@ -702,7 +710,7 @@ def _xdotool_save_state(slot: int) -> bool:
         return True
 
     log.info("xdotool: shift+F%d sent to window %s — waiting for write (max %.1fs)", slot, wid, SSTATE_WAIT)
-    if not _wait_for_sstate_write(state_dir, before, time.monotonic() + SSTATE_WAIT):
+    if not _wait_for_sstate_write(state_dir, before, time.monotonic() + SSTATE_WAIT, slot):
         log.warning("Save: state write not confirmed within %.1fs (key was sent)", SSTATE_WAIT)
     return True
 
