@@ -198,3 +198,18 @@ The broker controls PulseAudio sink volume for the `abc` user. Verify PulseAudio
 
 **Controller input stops working after game switch**
 This is prevented by `BackgroundInput = True` in `Dolphin.ini` (set automatically by the broker). If input drops, check the broker log for socket cleanup warnings.
+
+**Nothing reaches Dolphin — neither broker hotkeys nor browser gamepad**
+Both transports die together when Dolphin's global input gate shuts, so treat
+simultaneous failure as one bug, not two. The gate is fed by two settings whose
+Dolphin sections differ and whose defaults both demand render-window focus —
+focus the window never gets, since Dolphin is an Xwayland client under labwc:
+
+| Setting | Section | Default | Broker sets |
+|---|---|---|---|
+| `HotkeysRequireFocus` | `[General]` | `True` | `False` |
+| `BackgroundInput` | `[Input]` | `False` | `True` |
+
+Note `BackgroundInput` lives under `[Input]`, **not** `[General]`. Placed in the
+wrong section it is silently ignored and the gate stays shut. Verify with
+`grep -A1 '\[Input\]' Dolphin.ini`; the emulator must be restarted to reload it.

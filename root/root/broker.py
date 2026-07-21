@@ -122,6 +122,19 @@ def _validate_rom_path(raw: str) -> Path | None:
     return p
 
 
+def _chown_abc(path: Path):
+    """Hand a broker-written file back to abc.
+
+    The broker runs as root, so anything it writes lands root-owned and
+    Dolphin (running as abc) can read but never rewrite it — every setting
+    Dolphin tries to persist is then silently dropped.
+    """
+    try:
+        os.chown(path, _LOG_UID, _LOG_GID)
+    except OSError as exc:
+        log.warning("Could not chown %s to %d:%d: %s", path, _LOG_UID, _LOG_GID, exc)
+
+
 def _patch_ini(fullscreen: bool = False):
     """Patch Dolphin.ini to set required broker defaults.
 
@@ -142,6 +155,9 @@ def _patch_ini(fullscreen: bool = False):
         try:
             INI_PATH.write_text(
                 "[General]\n"
+                "HotkeysRequireFocus = False\n"
+                "\n"
+                "[Input]\n"
                 "BackgroundInput = True\n"
                 "\n"
                 "[Core]\n"
@@ -169,11 +185,27 @@ def _patch_ini(fullscreen: bool = False):
             log.error("Could not create %s: %s — broker defaults not applied",
                       INI_PATH, exc)
             return
+        _chown_abc(INI_PATH)
         log.info("Created Dolphin.ini with broker defaults (fullscreen=%s)", fullscreen)
         return
 
+    # Both keys below feed Core::UpdateInputGate, which drives the single
+    # global ControlReference input gate. When that gate is shut every
+    # ControlReference reads 0 — hotkeys, GC pads and Wiimotes alike — so a
+    # wrong value here kills xdotool and browser gamepad input together.
+    #
+    # Section names are Dolphin's, not ours, and the two differ:
+    #   MAIN_FOCUSED_HOTKEYS        [General] HotkeysRequireFocus  default True
+    #   MAIN_INPUT_BACKGROUND_INPUT [Input]   BackgroundInput      default False
+    # Both defaults require the render window to hold focus, which it never
+    # does: Dolphin is an Xwayland client under labwc and the surface is not
+    # given keyboard focus. BackgroundInput lived under [General] until
+    # 2026-07-20, where Dolphin never read it.
     target = {
         "General": {
+            "HotkeysRequireFocus": "False",
+        },
+        "Input": {
             "BackgroundInput": "True",
         },
         "Core": {
@@ -241,6 +273,7 @@ def _patch_ini(fullscreen: bool = False):
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(INI_PATH)
+        _chown_abc(INI_PATH)
         log.debug("Dolphin.ini patched (ConfirmStop)")
     except Exception as exc:
         log.error("Failed to patch Dolphin.ini: %s", exc)
