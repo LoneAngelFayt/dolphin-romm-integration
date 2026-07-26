@@ -70,7 +70,7 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
 | `GET` | `/status` | Current session info including slot config |
-| `POST` | `/launch` | Launch a ROM (`{"rom_path": "..."}`). Optional `"load_slot": N` (`0` or omitted resolves to `SAVE_SLOT`; `1`-`8` addressable) resumes from that state slot: the broker resolves the slot to its state file and passes it to Dolphin as `--save_state`, so the state is applied during boot, before emulation starts, so the game is never seen running un-resumed. Returns `404` if the slot has no state file. Push the state file via `PUT /state-file` before launching. |
+| `POST` | `/launch` | Launch a ROM (`{"rom_path": "..."}`, a file or a game folder, see [ROM path resolution](#rom-path-resolution)). Optional `"load_slot": N` (`0` or omitted resolves to `SAVE_SLOT`; `1`-`8` addressable) resumes from that state slot: the broker resolves the slot to its state file and passes it to Dolphin as `--save_state`, so the state is applied during boot, before emulation starts, so the game is never seen running un-resumed. Returns `404` if the slot has no state file. Push the state file via `PUT /state-file` before launching. |
 | `DELETE` | `/launch` | Return to Dolphin dashboard |
 | `POST` | `/save-and-exit` | Save then stop game (`{"slot": N, "wait": true}`, `0` or omitted = `SAVE_SLOT`) |
 | `POST` | `/save-state` | Save state in background (`{"slot": N}`, `0` or omitted = `SAVE_SLOT`) |
@@ -85,6 +85,26 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 | `POST` | `/volume` | Set PulseAudio volume (`{"level": 80}`) |
 | `POST` | `/mute` | Mute/unmute (`{"mute": true}` or `{}` to toggle) |
 | `POST` | `/cleanup` | Restart selkies to flush stale gamepad connections |
+
+### ROM path resolution
+
+`rom_path` must exist and be under `ROM_ROOT`. It may be either a file or a
+**directory**, for libraries laid out one game per folder
+(`roms/gc/Metroid Prime/Metroid Prime.iso`). RomM addresses such a game by its
+folder, because `Rom.full_path` is `fs_path/fs_name` and for a multi-file ROM
+`fs_name` is the directory, so the broker looks inside for the disc image: the
+folder itself first, then one level down for the per-disc subfolders some sets
+use. Candidates are ranked by format (`.rvz`, `.iso`, `.gcm`, `.wbfs`, `.wia`,
+`.gcz`, `.ciso`, `.tgc`, `.wad`, `.dol`, `.elf`) and then by name, so a
+multi-disc set boots disc 1 and a real disc image wins over a homebrew `.dol`
+sitting beside it. `.m3u` playlists are skipped, because Dolphin boots the disc
+itself and every folder shipping a playlist also ships the discs it points at.
+Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is never
+chosen. The resolved file is what `/status` and the response body report.
+
+A directory with nothing bootable inside returns `422` with the accepted
+extensions in an `extensions` field, which is a different message from the
+`422` for a path that does not exist at all.
 
 ### Memory Cards
 

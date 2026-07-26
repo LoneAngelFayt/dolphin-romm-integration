@@ -197,6 +197,26 @@ class Launch(ApiTestCase):
         )
         self.assertEqual(resp.status, 422)
 
+    def test_launching_a_game_folder_boots_the_file_inside(self):
+        rom = write(self.rom_root / "Metroid Prime" / "Metroid Prime.iso")
+        resp = self.request(
+            "POST", "/launch", {"rom_path": str(self.rom_root / "Metroid Prime")}
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.json()["rom_path"], str(rom.resolve()))
+        self.wait_for_launch()
+        self.assertEqual(self.launches[-1], (str(rom.resolve()), None))
+
+    def test_reports_a_folder_with_no_bootable_file_distinctly(self):
+        write(self.rom_root / "Metroid Prime" / "cover.png")
+        resp = self.request(
+            "POST", "/launch", {"rom_path": str(self.rom_root / "Metroid Prime")}
+        )
+        self.assertEqual(resp.status, 422)
+        body = resp.json()
+        self.assertIn("no bootable ROM file", body["error"])
+        self.assertIn(".rvz", body["extensions"])
+
     def test_rejects_an_out_of_range_load_slot(self):
         rom = write(self.rom_root / "game.iso")
         for slot in (-1, broker.MAX_SLOT + 1, "8", 1.5):
