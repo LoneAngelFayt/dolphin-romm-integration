@@ -1,23 +1,37 @@
-# dolphin-romm-integration-mod
+# dolphin-romm-integration
 
-A [linuxserver Docker mod](https://www.linuxserver.io/blog/2019-09-14-customizing-our-containers) for [linuxserver/dolphin](https://docs.linuxserver.io/images/docker-dolphin/) that adds [RomM](https://github.com/rommapp/romm) streaming support.
+A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customization) that lets [RomM](https://github.com/rommapp/romm) drive [Dolphin](https://dolphin-emu.org/). Pick a GameCube or Wii game in the RomM web UI, and it boots in the Dolphin container and streams back to your browser.
 
-An HTTP broker runs inside the container and manages the Dolphin lifecycle: game launches, save/load state, volume control, and returning to dashboard when a session ends. The display streams back to the RomM player via the container's built-in WebRTC/selkies setup.
+## What the broker actually is
 
----
+The mod drops a single Python file into the [linuxserver/dolphin](https://docs.linuxserver.io/images/docker-dolphin/) container and runs it as an s6 service (`svc-broker`). It is a small HTTP server, stdlib only, on port 8000. RomM talks to it; it talks to Dolphin.
 
-## How It Works
+Dolphin has no remote control API, so something inside the container has to act as the person at the keyboard. That is the broker:
 
-An S6 service (`svc-broker`) runs `broker.py` as root inside the container. The broker:
+```
+browser ──── selkies (WebRTC video) ────┐
+                                        │
+RomM backend ──── HTTP ──── broker ──── dolphin-emu
+                                │
+                                ├── xdotool       hotkeys for save and load state
+                                ├── Dolphin.ini   patched before every launch
+                                ├── --save_state  resume applied during boot
+                                └── pactl         volume and mute
+```
 
-1. Kills any stale Dolphin process on startup, then launches Dolphin in dashboard mode.
-2. Accepts HTTP requests from the RomM backend to launch ROMs, save/load state, set volume, and stop sessions.
-3. Auto-saves to `SAVE_SLOT` whenever a game is exited or switched.
-4. Monitors the Dolphin process and relaunches it into dashboard mode if it exits unexpectedly.
+Five things are worth knowing before the API makes sense:
 
----
+**Dolphin is always running.** There is no stopped state. With no game loaded the broker keeps Dolphin alive on its own dashboard, so the stream always shows something. If Dolphin dies the broker relaunches it with exponential backoff (5s doubling to 60s) and gives up after five failures rather than respawning a broken renderer forever.
 
-## Quick Start
+**Everything goes through xdotool.** Unlike PCSX2's PINE socket, Dolphin offers no IPC, so save and load are synthesised keypresses (`Shift+F1`-`Shift+F8` to save, `F1`-`F8` to load) against the Dolphin window. That makes the input gate load-bearing, and it is the single most common thing to break. See [when nothing reaches Dolphin](#nothing-reaches-dolphin).
+
+**Resuming is different from loading.** `POST /load-state` presses a key at a running game. A `load_slot` on `POST /launch` instead passes `--save_state` on Dolphin's command line, so the state is applied during boot and the game is never briefly visible un-resumed. Two mechanisms, two code paths, same slots.
+
+**One slot, not eight.** Dolphin has eight, but RomM exposes no slot picker, so every save and load funnels through `SAVE_SLOT` (default 8). See [Save slots](#save-slots).
+
+**Two kinds of save.** Savestates are whole-emulator snapshots, handled by `/state-file`. In-game saves are GameCube memory card files and Wii NAND titles, handled by `/save-file` and `/memory-card`. RomM syncs them separately, and the memory card needs [a fixed folder card](#memory-cards).
+
+## Quick start
 
 ```yaml
 services:
@@ -28,24 +42,17 @@ services:
       - PGID=1000
       - DOCKER_MODS=ghcr.io/loneangelfayt/dolphin-romm-integration-mod:latest
       - ROM_ROOT=/romm/library
-      - BROKER_PORT=8000          # optional, default 8000
-      - BROKER_SECRET=            # optional shared secret
-      - SSTATE_WAIT=3.0           # optional, seconds to wait after save key
-      - BROKER_LOG_LEVEL=INFO     # DEBUG for verbose output
+      - BROKER_SECRET=your_secret_here
     ports:
       - 3000:3000   # WebRTC stream
       - 3001:3001   # HTTPS stream
-      - 8000:8000   # Broker API
+      - 8000:8000   # broker API
     volumes:
       - /path/to/romm/library:/romm/library:ro
       - dolphin-config:/config
 ```
 
----
-
-## RomM Configuration
-
-In your RomM `config.yml`, enable streaming for GameCube and/or Wii:
+Then enable streaming in RomM's `config.yml`:
 
 ```yaml
 streaming:
@@ -60,177 +67,183 @@ streaming:
       label: Dolphin
 ```
 
----
+`memory_card_sync` belongs on the `ngc` entry only. Wii saves live in NAND rather than on a card, so the `wii` entry uses the `/save-file` path instead.
 
-## Broker API
+The ROM volume has to be mounted at the same path in both containers. If RomM sees `/romm/library/ngc/game.rvz`, Dolphin must see it there too, or every launch will 422.
 
-All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET` is set.
+## Configuration
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Returns `{"status": "ok"}` |
-| `GET` | `/status` | Current session info including slot config |
-| `POST` | `/launch` | Launch a ROM (`{"rom_path": "..."}`, a file or a game folder, see [ROM path resolution](#rom-path-resolution)). Optional `"load_slot": N` (`0` or omitted resolves to `SAVE_SLOT`; `1`-`8` addressable) resumes from that state slot: the broker resolves the slot to its state file and passes it to Dolphin as `--save_state`, so the state is applied during boot, before emulation starts, so the game is never seen running un-resumed. Returns `404` if the slot has no state file. Push the state file via `PUT /state-file` before launching. |
-| `DELETE` | `/launch` | Return to Dolphin dashboard |
-| `POST` | `/save-and-exit` | Save then stop game (`{"slot": N, "wait": true}`, `0` or omitted = `SAVE_SLOT`) |
-| `POST` | `/save-state` | Save state in background (`{"slot": N}`, `0` or omitted = `SAVE_SLOT`) |
-| `POST` | `/load-state` | Load a state (`{"slot": N}`, `0` or omitted = `SAVE_SLOT`). `409` while a save is in flight, so a load never races the write it would overwrite. |
-| `GET` | `/state-file?slot=N` | Newest state file for slot N as raw bytes; the filename is echoed in the `X-State-Filename` header. Blocks while a save is in flight (up to `STATE_GET_WAIT`) so a GET after `/save-state` carries the finished write. `slot=0` resolves to `SAVE_SLOT`; returns `404` if the slot has no state, and `409` if the save is still running when `STATE_GET_WAIT` expires (the file on disk is mid-flush and must not be stored as the state). |
-| `PUT` | `/state-file?filename=NAME` | Write raw body into StateSaves as `NAME` (used by RomM to hydrate a claimed container). `NAME` must be a bare `<GameID>.sNN` basename with `NN` in `01`-`08`; write is atomic and chowned to `abc`. Max 256 MB. |
-| `GET` | `/state-screenshot?slot=N` | PNG frame captured at the moment slot N was saved, used by RomM as the state's thumbnail. `404` if the slot has no capture, `409` if a save is still in flight after `STATE_GET_WAIT`. |
-| `GET` | `/save-file` | Zip of every in-game save (GC cards, Wii NAND titles) modified since the last game launch. `404` with `X-Save-File: unchanged` when nothing changed, or `X-Save-File: absent` when no game has been launched. An untagged `404` means the endpoint is missing, not that there is nothing to sync. |
-| `PUT` | `/save-file` | Restore a pulled save archive. Files newer in the container than in the archive are skipped. Max 256 MB. |
-| `GET` | `/memory-card` | Zip of the whole Slot-A GCI folder card, member paths relative to the card root. `404` with `X-Memory-Card: absent` when no card exists yet. |
-| `PUT` | `/memory-card` | Wipe Slot A and lay down the card in the body. Staged then swapped, so a failure never leaves a half-wiped card. Max 256 MB. |
-| `POST` | `/volume` | Set PulseAudio volume (`{"level": 80}`) |
-| `POST` | `/mute` | Mute/unmute (`{"mute": true}` or `{}` to toggle) |
-| `POST` | `/cleanup` | Restart selkies to flush stale gamepad connections |
+`BROKER_SECRET` is the one worth setting. The rest have working defaults.
 
-### ROM path resolution
+| Variable | Default | What it does |
+|---|---|---|
+| `BROKER_SECRET` | *(empty)* | Shared secret, sent as `X-Broker-Secret`. Empty means every request is accepted. |
+| `BROKER_PORT` | `8000` | Port the broker listens on. |
+| `ROM_ROOT` | `/romm/library` | Where ROMs are mounted. A `rom_path` outside this is rejected. |
+| `SAVE_SLOT` | `8` | The one slot every state save and load uses (1-8). |
+| `SSTATE_WAIT` | `10.0` | Seconds to wait for a state write to land before killing Dolphin. Falls back to a flat 3s sleep if `StateSaves` doesn't exist yet. |
+| `STATE_GET_WAIT` | `30.0` | How long `GET /state-file` waits for an in-flight save before giving up. |
+| `SCREENSHOT_WAIT` | `5.0` | How long to wait for the screenshot hotkey to produce a PNG before shipping the state without a thumbnail. |
+| `DISPLAY_WAIT` | `30.0` | How long to wait for the X socket at startup before starting anyway. |
+| `SSTATE_DIR` | *(probed)* | Savestate directory. Normally found under Dolphin's data dir; override if your build puts it somewhere unusual. |
+| `SAVE_DATA_ROOT` | *(probed)* | Dolphin's data dir. Both the XDG (`/config/.local/share/dolphin-emu`) and non-XDG (`/config/.config/dolphin-emu`) layouts are probed, since it varies by build. |
+| `GCI_CARD_DIR` | *(derived)* | Slot-A GCI folder card path. Defaults to `romm/Card A` under the data dir. |
+| `BROKER_SPOOL_DIR` | `/config/.romm-broker-spool` | Where uploads spool to disk. Falls back to the system temp dir if it can't be created. |
+| `DOLPHIN_LOG_PATH` | `/config/dolphin.log` | Captures Dolphin's stdout and stderr. Renderer failures show up here. |
+| `BROKER_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`. |
+| `PUID` / `PGID` | `1000` | Standard LinuxServer UID/GID. Also used to chown files the broker writes for Dolphin, which runs as `abc`. |
 
-`rom_path` must exist and be under `ROM_ROOT`. It may be either a file or a
-**directory**, for libraries laid out one game per folder
-(`roms/gc/Metroid Prime/Metroid Prime.iso`). RomM addresses such a game by its
-folder, because `Rom.full_path` is `fs_path/fs_name` and for a multi-file ROM
-`fs_name` is the directory, so the broker looks inside for the disc image: the
-folder itself first, then one level down for the per-disc subfolders some sets
-use. Candidates are ranked by format (`.rvz`, `.iso`, `.gcm`, `.wbfs`, `.wia`,
-`.gcz`, `.ciso`, `.tgc`, `.wad`, `.dol`, `.elf`) and then by name, so a
-multi-disc set boots disc 1 and a real disc image wins over a homebrew `.dol`
-sitting beside it. `.m3u` playlists are skipped, because Dolphin boots the disc
-itself and every folder shipping a playlist also ships the discs it points at.
-Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is never
-chosen. The resolved file is what `/status` and the response body report.
+## API
 
-A directory with nothing bootable inside returns `422` with the accepted
-extensions in an `extensions` field, which is a different message from the
-`422` for a path that does not exist at all.
+Send `X-Broker-Secret` on every request when `BROKER_SECRET` is set. File bodies are capped at 256 MB.
 
-### Memory Cards
+| Endpoint | Does | Notable failures |
+|---|---|---|
+| `GET /health` | `{"status": "ok"}` if the broker is up | none |
+| `GET /status` | Session info plus the configured slot, see [below](#session-state) | none |
+| `POST /launch` | Boot a ROM. `{"rom_path": "..."}`, a file or a folder. Optional `load_slot` resumes via `--save_state`, see [below](#launching) | `404` that slot has no state file, `422` path missing or nothing bootable in the folder |
+| `DELETE /launch` | Stop the game, back to the dashboard | none |
+| `POST /save-and-exit` | Save, then stop. `{"slot": N, "wait": true}` | `409` no game running |
+| `POST /save-state` | Save in the background. `{"slot": N}` | `409` no game running or save in progress |
+| `POST /load-state` | Load into the running game. `{"slot": N}` | `409` a save is in flight, so a load can't race the write it would overwrite |
+| `GET /state-file?slot=N` | Newest state file for the slot, raw bytes. Filename echoed in `X-State-Filename`. Blocks while a save is running, so a GET straight after `/save-state` carries the finished write | `404` no state, `409` still saving after `STATE_GET_WAIT` (the file is mid-flush and must not be stored) |
+| `PUT /state-file?filename=NAME` | Write a state file back, atomically, chowned to `abc`. `NAME` must be a bare `<GameID>.sNN` basename with `NN` in `01`-`08` | `400` bad name or truncated body |
+| `GET /state-screenshot?slot=N` | PNG captured when the slot was saved, used as RomM's thumbnail. See [below](#state-screenshots) | `404` no capture, `409` still saving |
+| `GET /save-file` | Zip of in-game saves (GC cards, Wii NAND titles) changed since the last launch | `404` + `X-Save-File: unchanged` when nothing changed, `X-Save-File: absent` when nothing has launched. An *untagged* `404` means the endpoint is missing, not that there's nothing to sync |
+| `PUT /save-file` | Restore a save archive. Files newer in the container are skipped, so a restore can't roll back newer saves | `400` bad archive |
+| `GET /memory-card` | The whole Slot-A GCI folder card as one zip, paths relative to the card root | `404` + `X-Memory-Card: absent` when there is no card yet |
+| `PUT /memory-card` | Replace Slot A wholesale. Staged then swapped, so a failure never leaves a half-wiped card | `400` bad archive |
+| `POST /volume` | `{"level": 80}` | `500` pactl failed |
+| `POST /mute` | `{"mute": true}`, or `{}` to toggle | `500` pactl failed |
+| `POST /cleanup` | Restart selkies to flush stale gamepad connections. Use it if controllers go dead | none |
 
-Slot A is pinned to a GCI **folder** card at a fixed path (`GCIFolderAPathOverride`
-in `Dolphin.ini`), which the broker sets on every launch. Dolphin's default GCI
-folder sits under a region directory it picks from the booted game
-(`GC/USA/Card A`), which the broker cannot know before launch; the override is
-used verbatim, with no region or card-name parts appended, so there is one
-stable card directory per container.
+Slots are 1-8. `0` or an omitted slot resolves to `SAVE_SLOT` everywhere.
 
-That is what lets RomM treat the card as a single per-user image: `GET
-/memory-card` evacuates it at release, `PUT /memory-card` lays the next user's
-card down at claim. Slot B is never touched. Enable it per platform in RomM
-with `memory_card_sync: true` on the `ngc` container entry (Wii saves live in
-NAND, not on a card, so the `wii` entry keeps the `/save-file` path).
+### Session state
 
-### State Screenshots
+```json
+{
+  "active": true,
+  "rom_path": "/romm/library/ngc/game.rvz",
+  "rom_name": "game",
+  "started_at": "2026-01-01T00:00:00Z",
+  "save_slot": 8,
+  "autosave_slot": 8
+}
+```
 
-Dolphin savestates carry no embedded frame, so the broker takes one: the
-screenshot hotkey (`F9`) fires just before the save key and the PNG Dolphin
-writes to `ScreenShots` is filed under the slot for `GET /state-screenshot`.
-Firing before the save keeps the "Saved State to Slot N" banner out of the
-frame. It is best effort throughout: a failed capture never fails the save.
+`active` here means a game is genuinely running: the process is alive *and* a ROM is loaded, so an idle container on the dashboard reports `active: false`. (The PCSX2 broker differs, so don't carry the assumption across.) `rom_path`, `rom_name` and `started_at` are `null` whenever `active` is false. `save_slot` and `autosave_slot` are two names for the same number, kept for older RomM clients.
 
-### Save State Slots
+### Launching
 
-Dolphin supports 8 save state slots. RomM offers no slot selection, so **all state I/O funnels through a single slot, `SAVE_SLOT` (env, default 8)**, the same shape the pcsx2 broker uses. Splitting manual saves and auto-saves across two slots would only split the library's view of a session across two files.
+```json
+{ "rom_path": "/romm/library/ngc/game.rvz", "load_slot": 8 }
+```
 
-| Action | Slot | Hotkey |
-|--------|------|--------|
-| Save | `SAVE_SLOT` (`0` or omitted resolves to it; `1`-`8` addressable) | `Shift+F1` - `Shift+F8` |
-| Load | `SAVE_SLOT` (`0` or omitted resolves to it; `1`-`8` addressable) | `F1` - `F8` |
+`rom_path` may be a **directory**, which matters more than it sounds. RomM addresses a folder-organized game by its folder, because `Rom.full_path` is `fs_path/fs_name` and for a multi-file ROM `fs_name` *is* the directory. So a library laid out one game per folder (`roms/ngc/Metroid Prime/Metroid Prime.iso`) hands the broker a path Dolphin cannot boot. The broker looks inside: the folder itself first, then one level down for the per-disc subfolders some sets use, no deeper. Candidates rank by format (`.rvz`, `.iso`, `.gcm`, `.wbfs`, `.wia`, `.gcz`, `.ciso`, `.tgc`, `.wad`, `.dol`, `.elf`) then by name, so a multi-disc set boots disc 1 and a real disc image beats a homebrew `.dol` sitting beside it. `.m3u` playlists are skipped, since Dolphin boots the disc itself and any folder shipping a playlist also ships the discs it points at. Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is never chosen.
 
-`SAVE_SLOT` is written by manual saves, by save-and-exit, and automatically whenever you navigate away from a game (switch titles or click save-and-exit); every read defaults to it. The explicit `1`-`8` range stays addressable for debugging.
+A folder with nothing bootable inside returns `422` with an `extensions` list, which is a different message from the `422` for a path that doesn't exist. Every broker in this family behaves the same way here.
 
----
+`load_slot` resumes from a state, and it is not the same mechanism as `/load-state`. The broker resolves the slot to its state file and passes it to Dolphin as `--save_state`, so the state is applied during boot and the game is never seen running un-resumed. Push the state file with `PUT /state-file` *before* launching, or you get a `404`.
 
-## Environment Variables
+### Save slots
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BROKER_PORT` | `8000` | HTTP port the broker listens on |
-| `BROKER_SECRET` | _(empty)_ | Shared secret for request auth (`X-Broker-Secret` header) |
-| `ROM_ROOT` | `/romm/library` | ROM files must be within this path |
-| `SAVE_SLOT` | `8` | The one slot every state save and load uses (1-8) |
-| `SSTATE_WAIT` | `3.0` | Seconds to wait after save key before killing Dolphin |
-| `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` blocks waiting for an in-flight save to finish |
-| `BROKER_SPOOL_DIR` | `/config/.romm-broker-spool` | Where uploads are spooled to disk; falls back to the system temp dir if it cannot be created |
-| `DISPLAY_WAIT` | `30.0` | Max seconds to wait for the X server socket before starting anyway |
-| `SCREENSHOT_WAIT` | `5.0` | Max seconds to wait for the screenshot hotkey to produce a PNG before giving up on the state thumbnail |
-| `GCI_CARD_DIR` | _(derived)_ | Slot-A GCI folder card path; defaults to `romm/Card A` under Dolphin's data dir |
-| `BROKER_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`) |
+Dolphin has eight slots, but RomM offers no slot selection, so **all state I/O funnels through one slot, `SAVE_SLOT` (default 8)**, matching the PCSX2 broker. Splitting manual saves and autosaves across two slots would only split one session's view across two files.
 
----
+| Action | Hotkey the broker sends |
+|---|---|
+| Save | `Shift+F1` - `Shift+F8` |
+| Load | `F1` - `F8` |
 
-## Controller Setup
+`SAVE_SLOT` is written by manual saves, by save-and-exit, and automatically whenever you navigate away from a game. Every read defaults to it. The explicit `1`-`8` range stays addressable for debugging.
 
-The mod uses the [selkies joystick interposer](https://github.com/selkies-project/selkies-gstreamer) to forward browser gamepad input into the container as virtual Xbox 360 pads (`SDL/0-3/Microsoft X-Box 360 pad`).
+### Memory cards
 
-### Default mapping
+Slot A is pinned to a GCI **folder** card at a fixed path, via `GCIFolderAPathOverride` in `Dolphin.ini`, which the broker rewrites on every launch. Dolphin's own default puts the GCI folder under a region directory chosen from the booted game (`GC/USA/Card A`), which the broker cannot know *before* launch. The override is used verbatim, with no region or card-name parts appended, so there is exactly one stable card directory per container.
 
-All four GCPad ports are pre-mapped to the selkies virtual device on first launch. The mapping is seeded from `/defaults/GCPadNew.ini` only if no existing config is present, so your customisations are never overwritten.
+That is what lets RomM treat the card as a single per-user image: `GET /memory-card` evacuates it when a user releases the container, `PUT /memory-card` lays the next user's card down when they claim it. Slot B is never touched.
 
-### Calibration
+### State screenshots
 
-The selkies virtual controller uses a **circular gate** (values come from the browser Gamepad API which clamps to a unit circle). Dolphin's default calibration assumes a square gate and sets diagonal range to `141.42`, which causes the stick to appear short on NW/NE/SW/SE axes.
+Dolphin savestates carry no embedded frame, so the broker takes one: the screenshot hotkey (`F9`) fires just *before* the save key, and the PNG Dolphin drops in `ScreenShots` is filed under the slot for `GET /state-screenshot`. Firing first is deliberate, since it keeps the "Saved State to Slot N" banner out of the picture. The whole path is best effort: a failed capture never fails the save.
 
-**Fix:** all 8 calibration points should be `100.00`. Edit `GCPadNew.ini` directly on the host volume:
+### Display settings
+
+The broker forces these on every launch, and they cannot be overridden from Dolphin's GUI. They exist because selkies captures X11, and Dolphin will happily bypass X11 given the chance.
+
+| Setting | Value | Why |
+|---|---|---|
+| `GFXBackend` | `OpenGL` | Vulkan switches to Wayland WSI when `WAYLAND_DISPLAY` is set, bypassing X11 |
+| `RenderToMain` | `False` | `True` creates an unmapped render window in this build |
+| `QT_QPA_PLATFORM` | `xcb` | Without it Qt takes a broken Wayland path |
+| `WAYLAND_DISPLAY` | *(unset)* | Set, Dolphin renders straight to Wayland and X11 stays black |
+| `Fullscreen` | `True` in game, `False` on the dashboard | Stops the idle boot going black |
+
+## Controllers
+
+Browser gamepad input reaches the container through the [selkies joystick interposer](https://github.com/selkies-project/selkies-gstreamer) as virtual Xbox 360 pads (`SDL/0-3/Microsoft X-Box 360 pad`). All four GCPad ports are mapped to it on first launch, seeded from `/defaults/GCPadNew.ini` only when no config exists, so your own mappings are never overwritten.
+
+**Diagonals feel short?** That is a calibration mismatch, not a dead zone. The selkies virtual pad has a *circular* gate, because the browser Gamepad API clamps to a unit circle, while Dolphin's default calibration assumes a square gate and sets the diagonals to `141.42`. Set all eight points to `100.00` in `<config-volume>/.config/dolphin-emu/GCPadNew.ini` and restart the container:
 
 ```
 Main Stick/Calibration = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
-C-Stick/Calibration   = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
+C-Stick/Calibration    = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
 ```
 
-The file is at `<your-config-volume>/.config/dolphin-emu/GCPadNew.ini`. Restart the container after editing.
-
-### Persisting controller config
-
-Controller mapping and calibration are stored in the `/config` volume and survive game switches. Dolphin does **not** auto-save controller settings on exit: you must click the **Close** button (not just OK) in Dolphin's controller settings dialog to write changes to disk.
-
----
-
-## Display
-
-The mod forces the following rendering configuration for correct selkies capture:
-
-| Setting | Value | Reason |
-|---------|-------|--------|
-| `GFXBackend` | `OpenGL` | Vulkan activates Wayland WSI when `WAYLAND_DISPLAY` is set, bypassing X11 |
-| `RenderToMain` | `False` | `True` creates an unmapped render window in this Dolphin build |
-| `QT_QPA_PLATFORM` | `xcb` | Forces Qt to use XCB; without this Qt falls back to a broken Wayland path |
-| `WAYLAND_DISPLAY` | _(unset)_ | Must not be set; causes Dolphin to render directly to Wayland, leaving X11 black |
-| `Fullscreen` | `True` (game) / `False` (dashboard) | Prevents black screen on idle boot |
-
-These are applied by the broker on every Dolphin launch and cannot be overridden via Dolphin's GUI.
-
----
+Mapping and calibration live in `/config` and survive game switches. One catch: Dolphin does not save controller settings on exit, so you have to click **Close** (not just OK) in its controller dialog for changes to reach disk.
 
 ## Troubleshooting
 
-**Game launches but screen is black**
-Dolphin may take a few seconds to initialise. If black screen persists, check that `WAYLAND_DISPLAY` is not set in your container environment and that no other mod is injecting a fake libudev.
+### Nothing reaches Dolphin
 
-**Save state doesn't work**
-The broker sends xdotool keystrokes to the Dolphin window. If save/load appears to do nothing, check the broker logs for xdotool errors (`docker logs <container> | grep xdotool`). The game must be fully loaded before state operations work.
+Neither broker hotkeys nor browser gamepad input works. **Treat simultaneous failure as one bug, not two:** both transports die together when Dolphin's global input gate shuts. The gate is fed by two settings that live in *different* sections and whose defaults both demand render-window focus, which the window never gets, because Dolphin is an Xwayland client under labwc.
 
-**Stick doesn't reach full range on diagonals**
-See the [Calibration](#calibration) section above. The default `141.42` diagonal values must be changed to `100.00`.
-
-**Volume controls have no effect**
-The broker controls PulseAudio sink volume for the `abc` user. Verify PulseAudio is running in the container (`docker exec <container> pactl info`).
-
-**Controller input stops working after game switch**
-This is prevented by `BackgroundInput = True` in `Dolphin.ini` (set automatically by the broker). If input drops, check the broker log for socket cleanup warnings.
-
-**Nothing reaches Dolphin, neither broker hotkeys nor browser gamepad**
-Both transports die together when Dolphin's global input gate shuts, so treat
-simultaneous failure as one bug, not two. The gate is fed by two settings whose
-Dolphin sections differ and whose defaults both demand render-window focus,
-focus the window never gets, since Dolphin is an Xwayland client under labwc:
-
-| Setting | Section | Default | Broker sets |
+| Setting | Section | Dolphin default | Broker sets |
 |---|---|---|---|
 | `HotkeysRequireFocus` | `[General]` | `True` | `False` |
 | `BackgroundInput` | `[Input]` | `False` | `True` |
 
-Note `BackgroundInput` lives under `[Input]`, **not** `[General]`. Placed in the
-wrong section it is silently ignored and the gate stays shut. Verify with
-`grep -A1 '\[Input\]' Dolphin.ini`; the emulator must be restarted to reload it.
+`BackgroundInput` goes under `[Input]`, **not** `[General]`. In the wrong section it is silently ignored and the gate stays shut. Check with `grep -A1 '\[Input\]' Dolphin.ini`, and restart the emulator to reload it.
+
+### Everything else
+
+**Game launches, screen stays black.** Give Dolphin a few seconds. If it persists, confirm `WAYLAND_DISPLAY` is not set in the container environment and that no other mod is injecting a fake libudev. Check `DOLPHIN_LOG_PATH` for renderer errors.
+
+**Save state does nothing.** The game has to be fully loaded first. Then check for xdotool errors: `docker logs <container> | grep xdotool`. If input is dead generally, read [above](#nothing-reaches-dolphin) first.
+
+**Volume does nothing.** The broker drives the PulseAudio sink for the `abc` user. Confirm PulseAudio is up: `docker exec <container> pactl info`.
+
+**Controller input stops after a game switch.** `BackgroundInput = True` is meant to prevent this and the broker sets it. Check the broker log for socket cleanup warnings, and try `POST /cleanup`.
+
+## Development
+
+The broker is one stdlib Python file, and so is its test suite. Nothing to install, which is the point: the container has no pip, so the broker cannot grow a dependency without breaking the image.
+
+```bash
+python3 -m unittest discover -s tests -t tests
+```
+
+CI runs the same tests under pytest, plus `ruff check .` against the shared [ruff.toml](ruff.toml). See [tests/README.md](tests/README.md) for what each file covers, from ROM path resolution and ini patching through zip bombs, planted symlinks and interrupted card swaps. Anything needing a real X display or a live `dolphin-emu` process is out of scope on purpose, because it is only provable on a running container.
+
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/) and releases are cut automatically on merge to `main`: `fix:` bumps the patch, `feat:` the minor, `feat!:` the major.
+
+## Pinning a version
+
+```yaml
+- DOCKER_MODS=ghcr.io/loneangelfayt/dolphin-romm-integration-mod:v1.3.0   # exact
+- DOCKER_MODS=ghcr.io/loneangelfayt/dolphin-romm-integration-mod:v1.3     # patches only
+- DOCKER_MODS=ghcr.io/loneangelfayt/dolphin-romm-integration-mod:latest   # always newest
+```
+
+## Resources
+
+- [Releases and changelog](https://github.com/LoneAngelFayt/dolphin-romm-integration/releases) and the [published images](https://github.com/LoneAngelFayt/dolphin-romm-integration/pkgs/container/dolphin-romm-integration-mod)
+- [RomM](https://github.com/rommapp/romm) and its [wiki](https://github.com/rommapp/romm/wiki)
+- [linuxserver/dolphin](https://docs.linuxserver.io/images/docker-dolphin/) and [how Docker Mods work](https://docs.linuxserver.io/general/container-customization)
+- [Dolphin](https://dolphin-emu.org/) and its [wiki](https://wiki.dolphin-emu.org/index.php?title=Help:Contents)
+- [selkies](https://github.com/selkies-project/selkies-gstreamer), which does the WebRTC streaming and the joystick interposer
+- Sibling brokers, same shape, different emulators: [PCSX2](https://github.com/LoneAngelFayt/pcsx2-romm-integration), [xemu](https://github.com/LoneAngelFayt/xemu-romm-integration), [RPCS3](https://github.com/LoneAngelFayt/rpcs3-romm-integration), [Eden](https://github.com/LoneAngelFayt/eden-romm-integration)
+
+## License
+
+[GPLv3](LICENSE)
