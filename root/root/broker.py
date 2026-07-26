@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from collections.abc import Iterable
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from threading import Thread, Lock
@@ -143,6 +144,76 @@ def _validate_rom_path(raw: str) -> Path | None:
     if not p.is_relative_to(ROM_ROOT):
         return None
     return p
+
+
+# Formats Dolphin can boot, best first: a folder holding several candidates
+# picks by this order, so a .rvz beats the uncompressed .iso beside it and a
+# real disc image beats a homebrew .dol dropped in the same folder.
+# .m3u is deliberately absent, because Dolphin boots the disc itself and every
+# folder shipping a playlist also ships the discs it points at.
+ROM_EXTENSIONS = (
+    ".rvz", ".iso", ".gcm", ".wbfs", ".wia", ".gcz", ".ciso", ".tgc",
+    ".wad", ".dol", ".elf",
+)
+
+# Where to look for the disc image below a game folder. The folder itself
+# first, then one level down for the per-disc subfolders some sets use
+# (Game/Disc 1/game.iso). Nothing deeper: a launch must not pay for a full
+# walk of a large set, and anything further down is extras, not the game.
+_ROM_SEARCH_GLOBS = ("*", "*/*")
+
+
+def _resolve_rom_file(path: Path) -> Path | None:
+    """Return the file Dolphin should boot for `path`, or None if there isn't
+    one.
+
+    RomM addresses a folder-organized game by its folder: `Rom.full_path` is
+    `fs_path/fs_name`, and for a multi-file ROM `fs_name` is the directory,
+    not the disc image inside it. So /launch regularly receives something like
+    `.../roms/gc/Metroid Prime` for a library laid out one game per folder.
+    A path that is already a file passes straight through.
+    """
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        return None
+    for pattern in _ROM_SEARCH_GLOBS:
+        try:
+            found = _pick_rom_file(path.glob(pattern))
+        except OSError:
+            # Libraries are routinely NFS mounts, so a stalled or vanished
+            # share surfaces here as an OSError mid-walk. Report it as "no
+            # bootable file" rather than 500-ing the launch.
+            return None
+        if found is not None:
+            return found
+    return None
+
+
+def _pick_rom_file(candidates: Iterable[Path]) -> Path | None:
+    """Best bootable file among `candidates`, by format preference then name
+    (which puts 'Disc 1' ahead of 'Disc 2' for a multi-disc set)."""
+    ranked: list[tuple[int, str, Path]] = []
+    for p in candidates:
+        if p.name.startswith("."):
+            continue
+        ext = p.suffix.lower()
+        if ext not in ROM_EXTENSIONS:
+            continue
+        try:
+            if not p.is_file():
+                continue
+            # A symlink in the folder must not walk the launch out of
+            # ROM_ROOT: _validate_rom_path only vetted the folder itself.
+            real = p.resolve()
+        except OSError:
+            continue
+        if not real.is_relative_to(ROM_ROOT):
+            continue
+        ranked.append((ROM_EXTENSIONS.index(ext), p.name.lower(), real))
+    if not ranked:
+        return None
+    return min(ranked)[2]
 
 
 def _chown_abc(path: Path):
@@ -1962,6 +2033,20 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not rom_path.exists():
             self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
             return
+
+        # A folder-organized game arrives as its folder, which Dolphin cannot
+        # boot; find the disc image inside it.
+        rom_file = _resolve_rom_file(rom_path)
+        if rom_file is None:
+            self._send_json(422, {
+                "error": "no bootable ROM file found under rom_path",
+                "path": str(rom_path),
+                "extensions": list(ROM_EXTENSIONS),
+            })
+            return
+        if rom_file != rom_path:
+            log.info("Resolved ROM folder %s to %s", rom_path, rom_file)
+        rom_path = rom_file
 
         # Resume-from-state: hand the state to Dolphin at boot.
         load_slot = body.get("load_slot")
