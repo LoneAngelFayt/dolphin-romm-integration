@@ -92,15 +92,26 @@ All `POST`/`DELETE` endpoints require `X-Broker-Secret` header if `BROKER_SECRET
 **directory**, for libraries laid out one game per folder
 (`roms/gc/Metroid Prime/Metroid Prime.iso`). RomM addresses such a game by its
 folder, because `Rom.full_path` is `fs_path/fs_name` and for a multi-file ROM
-`fs_name` is the directory, so the broker looks inside for the disc image: the
-folder itself first, then one level down for the per-disc subfolders some sets
-use. Candidates are ranked by format (`.rvz`, `.iso`, `.gcm`, `.wbfs`, `.wia`,
-`.gcz`, `.ciso`, `.tgc`, `.wad`, `.dol`, `.elf`) and then by name, so a
-multi-disc set boots disc 1 and a real disc image wins over a homebrew `.dol`
-sitting beside it. `.m3u` playlists are skipped, because Dolphin boots the disc
-itself and every folder shipping a playlist also ships the discs it points at.
-Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is never
-chosen. The resolved file is what `/status` and the response body report.
+`fs_name` is the directory, so the broker looks inside for the disc image, in
+the folder itself and one level down for the per-disc subfolders some sets use.
+Everything found across both levels is ranked together, in this order:
+
+1. **Disc number**, read from the file or folder name (`Disc 1`, `(Disc 2)`,
+   `CD1`), so a multi-disc set like RE4 starts on disc 1. The number is compared
+   as a number, which keeps disc 2 ahead of disc 10. A name that mentions no
+   disc counts as disc 1.
+2. **Format**: `.rvz`, `.iso`, `.gcm`, `.wbfs`, `.wia`, `.gcz`, `.ciso`,
+   `.tgc`, `.wad`, `.dol`, `.elf`. This decides between two candidates for the
+   same disc, so a real disc image wins over a homebrew `.dol` beside it.
+3. **Depth**, so the image sitting in the game folder wins over one buried in
+   an extras subfolder.
+
+`.m3u` playlists are skipped, because Dolphin boots the disc itself and every
+folder shipping a playlist also ships the discs it points at. Dot-files are
+skipped, and a symlink pointing outside `ROM_ROOT` is never chosen. The resolved
+file is what `/status` and the response body report. Note that resolution only
+chooses where a session *starts*: there is no disc swapping, so a game that asks
+for its next disc cannot be given one.
 
 A directory with nothing bootable inside returns `422` with the accepted
 extensions in an `extensions` field, which is a different message from the
