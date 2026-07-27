@@ -336,10 +336,12 @@ def _patch_ini(fullscreen: bool = False):
     # Section names are Dolphin's, not ours, and the two differ:
     #   MAIN_FOCUSED_HOTKEYS        [General] HotkeysRequireFocus  default True
     #   MAIN_INPUT_BACKGROUND_INPUT [Input]   BackgroundInput      default False
-    # Both defaults require the render window to hold focus, which it never
-    # does: Dolphin is an Xwayland client under labwc and the surface is not
-    # given keyboard focus. BackgroundInput lived under [General] until
-    # 2026-07-20, where Dolphin never read it.
+    # Both defaults require the render window to hold focus. It usually does —
+    # verified live, the Xwayland window holds X focus and _NET_ACTIVE_WINDOW —
+    # but only while a client is connected and driving labwc; keys injected
+    # with no stream attached, and keys arriving during a launch or a window
+    # swap, land outside that window. BackgroundInput lived under [General]
+    # until 2026-07-20, where Dolphin never read it.
     target = {
         "General": {
             "HotkeysRequireFocus": "False",
@@ -1017,6 +1019,88 @@ def _pactl_get_mute() -> bool | None:
     if result.returncode != 0:
         return None
     return result.stdout.strip().endswith("yes")
+
+
+# The sink selkies streams to the browser. Its monitor, output.monitor, is what
+# pcmflux captures (selkies' audio_device_name default); anything Dolphin plays
+# into a different sink is inaudible in the stream.
+STREAM_SINK = "output"
+
+# Both null sinks the base image expects: "output" is streamed to the browser,
+# "input" backs the virtual microphone.
+_AUDIO_SINKS = (STREAM_SINK, "input")
+
+
+def _pactl_sink_names() -> list[str] | None:
+    """Return the names of all PulseAudio sinks, or None if pactl failed."""
+    result = _pactl("list", "short", "sinks")
+    if result.returncode != 0:
+        return None
+    # "index<TAB>name<TAB>driver<TAB>sample-spec<TAB>state"; sink names may
+    # contain spaces, so split on tabs rather than whitespace.
+    return [
+        parts[1] for parts in (line.split("\t") for line in result.stdout.splitlines())
+        if len(parts) >= 2
+    ]
+
+
+def _ensure_audio_sinks(timeout: float = 15.0) -> None:
+    """Create the null sinks svc-selkies may have failed to load, and pick one.
+
+    svc-selkies loads both sinks at container start behind a guard that waits
+    for PulseAudio's pid file:
+
+        until [ -f /defaults/pid ]; do sleep .5; done
+        pactl load-module module-null-sink sink_name="output" ...
+        pactl load-module module-null-sink sink_name="input" ...
+        touch /dev/shm/audio.lock
+
+    PulseAudio writes that pid file a few milliseconds *before* it accepts
+    connections on /defaults/native, so the first load-module can land in the
+    gap and die with "Connection refused" (observed live: pid file at
+    02:27:55.005, socket at 02:27:55.012, the failure at 02:27:55.012). The
+    "output" sink is then never created, the lock file suppresses any retry for
+    the life of the container, and every pcmflux start fails with
+    "pa_simple_new() failed: No such entity" — a permanently silent stream.
+
+    Called from main() after _wait_for_display(), which only returns once
+    selkies has brought up Xwayland, i.e. well past its own sink setup, so this
+    cannot race it into loading a duplicate module.
+    """
+    deadline = time.monotonic() + timeout
+    names = _pactl_sink_names()
+    while names is None and time.monotonic() < deadline:
+        time.sleep(0.5)
+        names = _pactl_sink_names()
+    if names is None:
+        log.warning("PulseAudio unreachable after %.0fs; leaving audio sinks alone", timeout)
+        return
+
+    for sink in _AUDIO_SINKS:
+        if sink in names:
+            continue
+        result = _pactl(
+            "load-module", "module-null-sink",
+            f"sink_name={sink}",
+            f"sink_properties=device.description={sink}",
+        )
+        if result.returncode != 0:
+            log.error("Could not create missing '%s' sink: %s", sink, result.stderr.strip())
+            continue
+        names.append(sink)
+        log.info("Created missing PulseAudio sink '%s' (svc-selkies lost its startup race)", sink)
+
+    # Dolphin plays to the default sink. When "output" is missing at the time
+    # svc-selkies runs, "input" becomes the default and Dolphin's audio ends up
+    # in the microphone loopback, which nothing streams — so the default has to
+    # be moved back even after the sink itself is restored.
+    if STREAM_SINK not in names:
+        return
+    current = _pactl("get-default-sink")
+    if current.returncode != 0 or current.stdout.strip() == STREAM_SINK:
+        return
+    if _pactl("set-default-sink", STREAM_SINK).returncode == 0:
+        log.info("Default sink set to '%s' (was '%s')", STREAM_SINK, current.stdout.strip())
 
 
 def _restart_selkies():
@@ -2203,6 +2287,11 @@ def main():
     # Only done once at startup, not on game launches, where webrtc_input is
     # already running and manages its own socket lifecycle.
     _cleanup_stale_sockets()
+
+    # Before the first launch: Dolphin picks its cubeb output device once, at
+    # startup, so a sink restored afterwards would not reach the running
+    # instance.
+    _ensure_audio_sinks()
 
     # Launch Dolphin into its main menu so the stream shows something useful
     # whenever no game is playing.  Game launches kill this instance first.

@@ -220,11 +220,51 @@ The broker controls PulseAudio sink volume for the `abc` user. Verify PulseAudio
 **Controller input stops working after game switch**
 This is prevented by `BackgroundInput = True` in `Dolphin.ini` (set automatically by the broker). If input drops, check the broker log for socket cleanup warnings.
 
+**No sound in the stream**
+selkies streams one PulseAudio sink: `output`, captured through `output.monitor`.
+The base image creates that sink once, from `svc-selkies`, behind a guard that
+waits for PulseAudio's pid file — which PulseAudio writes a few milliseconds
+before it accepts connections. When `load-module` lands in that gap it dies with
+`Connection refused`, `/dev/shm/audio.lock` is touched anyway, and the sink is
+gone for the life of the container: `pactl list short sinks` shows only `input`,
+and the log repeats `[pcmflux] ERROR: pa_simple_new() failed: No such entity`.
+The broker recreates whichever sink is missing at startup and points the default
+sink back at `output`. If you hit this on a container running an older mod:
+
+```sh
+docker exec <container> s6-setuidgid abc pactl load-module module-null-sink sink_name=output sink_properties=device.description=output
+```
+
+then reconnect the browser tab so selkies restarts its audio pipeline. Run every
+`pactl` as `abc`; as root it starts a second PulseAudio server and Dolphin's
+`cubeb_stream_init` then fails on the next launch.
+
+**Keys from the browser do not reach Dolphin**
+The path is `keydown` → `kd,<keysym>` over the data websocket → selkies →
+`inject_key` on the Wayland virtual keyboard → labwc → Xwayland `:0` → Dolphin.
+It is testable without a browser, which is the fastest way to split client from
+server — replay a keysym on the data websocket (**port 8082**, not the
+documented 8081) and watch for it with `xev -id <dolphin window id>`. If the key
+lands, the fault is client-side.
+
+Client-side, two things silence the keyboard while the gamepad keeps working:
+
+- A URL hash of `#shared` or `#playerN` makes the client a viewer. Viewers never
+  call `attach_context()`, the only place the `keydown`/`keyup` listeners are
+  registered. The server logs the role on connect: look for `Role: controller`.
+- A superseded session. A second client claiming the same display evicts the
+  first (`Killing old client for 'primary'`), and the evicted tab keeps
+  rendering its last frame while sending into a closed socket. Reload it.
+
+Combinations the browser never delivers to a page (`Ctrl+W`, `Ctrl+T`, `F12`)
+cannot be forwarded by anything. Dolphin's own state hotkeys are unaffected by
+all of this: the broker sends F1–F8 and Shift+F1–F8 with xdotool inside the
+container, so RomM's save/load buttons work even when no browser is attached.
+
 **Nothing reaches Dolphin, neither broker hotkeys nor browser gamepad**
 Both transports die together when Dolphin's global input gate shuts, so treat
 simultaneous failure as one bug, not two. The gate is fed by two settings whose
-Dolphin sections differ and whose defaults both demand render-window focus,
-focus the window never gets, since Dolphin is an Xwayland client under labwc:
+Dolphin sections differ and whose defaults both demand render-window focus:
 
 | Setting | Section | Default | Broker sets |
 |---|---|---|---|
