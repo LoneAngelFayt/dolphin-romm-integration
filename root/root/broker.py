@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket as _socket
@@ -61,7 +62,40 @@ _SSTATE_DIR_CANDIDATES = tuple(r / "StateSaves" for r in _SAVE_DATA_ROOTS)
 # Dolphin's EXIDeviceType for a GCI folder card (Source/Core/Core/HW/EXI/EXI_Device.h).
 EXI_MEMORY_CARD_FOLDER = 8
 
+# Dolphin is launched through `sudo -u abc env K=V ...`, and sudo's default
+# env_reset drops everything the container was started with. Only the names
+# spelled out on that `env` line survive the hop, so every renderer knob an
+# operator sets in docker-compose — VK_DRIVER_FILES, __GLX_VENDOR_LIBRARY_NAME,
+# MESA_VK_DEVICE_SELECT — was silently discarded before it could take effect.
+# Forward the vendor namespaces wholesale rather than an exact list so a knob
+# we haven't heard of still arrives.
+_GPU_ENV_PREFIXES = (
+    "NVIDIA_", "VK_", "MESA_", "LIBGL_", "GALLIUM_", "RADV_", "AMD_",
+    "DRI_", "LIBVA_", "VDPAU_", "__GLX_", "__NV_", "__EGL_", "__VK_",
+)
+# XDG_DATA_DIRS is not a GPU knob, but the Vulkan loader searches it for
+# icd.d/ — dropping it hides ICDs installed outside /usr/share. DRINODE is the
+# linuxserver base image's render-node selector, which misses the DRI_ prefix.
+_GPU_ENV_NAMES = ("XDG_DATA_DIRS", "DRINODE")
+
+
+def _gpu_env() -> dict[str, str]:
+    """Graphics-related variables inherited from the container environment.
+
+    Empty values are skipped: `env VAR=` sets the variable to the empty string,
+    which for the likes of LIBGL_ALWAYS_SOFTWARE reads as set-and-false to some
+    consumers and set-and-true to others. DRI_NODE and DRINODE used to be
+    forwarded unconditionally this way, putting `DRINODE=` on every launch even
+    when the operator had never set it."""
+    return {
+        k: v for k, v in os.environ.items()
+        if v and (k.startswith(_GPU_ENV_PREFIXES) or k in _GPU_ENV_NAMES)
+    }
+
+
 ENV = {
+    # Inherited GPU vars come first so the explicit entries below always win.
+    **_gpu_env(),
     "DISPLAY":            ":0",
     # WAYLAND_DISPLAY intentionally omitted: if set, Dolphin's Vulkan backend
     # creates a VK_KHR_wayland_surface and renders directly to the Wayland
@@ -71,8 +105,6 @@ ENV = {
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "QT_QPA_PLATFORM":    "xcb",
     "PULSE_RUNTIME_PATH": "/defaults",
-    "DRI_NODE":           os.environ.get("DRI_NODE", ""),
-    "DRINODE":            os.environ.get("DRINODE", ""),
     "HOME":               "/config",
     "USER":               "abc",
     # The joystick interposer hooks open() on /dev/input/* and redirects to
@@ -102,6 +134,20 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("broker")
+
+# Report the forwarded GPU environment at startup. Renderer complaints almost
+# always begin with "my env vars aren't taking effect", and this line answers
+# that question from the broker log without a shell in the container.
+_forwarded_gpu = sorted(_gpu_env())
+if _forwarded_gpu:
+    log.info("Forwarding GPU environment to Dolphin: %s", ", ".join(_forwarded_gpu))
+else:
+    log.info(
+        "No GPU environment variables found to forward. If the renderer falls back to "
+        "llvmpipe, run `vulkaninfo --summary` in the container: NVIDIA absent means the "
+        "ICD was never injected (check NVIDIA_DRIVER_CAPABILITIES includes 'graphics'); "
+        "NVIDIA present means the failure is at surface creation instead."
+    )
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -162,6 +208,23 @@ ROM_EXTENSIONS = (
 # walk of a large set, and anything further down is extras, not the game.
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 
+# "Disc 1", "(Disc 2)", "CD1", "Disk_3" in a folder or file name. The leading
+# boundary keeps it off words that merely end in the letters, so "abcd2.iso" is
+# not read as disc 2.
+_DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
+
+
+def _disc_number(rel: Path) -> int:
+    """Disc number named anywhere in `rel`, or 1 when nothing names one.
+
+    Unmarked files count as disc 1 so that a single-disc game ranks level with
+    the first disc of a set, and so a false positive can only ever mean "first".
+    """
+    match = _DISC_RE.search(str(rel))
+    if match is None:
+        return 1
+    return max(1, int(match.group(1)))
+
 
 def _resolve_rom_file(path: Path) -> Path | None:
     """Return the file Dolphin should boot for `path`, or None if there isn't
@@ -177,23 +240,35 @@ def _resolve_rom_file(path: Path) -> Path | None:
         return path
     if not path.is_dir():
         return None
+    # Every level is collected before anything is ranked. Taking the first level
+    # that merely yields a match would let an extras file with a bootable
+    # extension beat the real game one level down.
+    candidates: list[Path] = []
     for pattern in _ROM_SEARCH_GLOBS:
         try:
-            found = _pick_rom_file(path.glob(pattern))
+            candidates.extend(path.glob(pattern))
         except OSError:
             # Libraries are routinely NFS mounts, so a stalled or vanished
             # share surfaces here as an OSError mid-walk. Report it as "no
             # bootable file" rather than 500-ing the launch.
             return None
-        if found is not None:
-            return found
-    return None
+    return _pick_rom_file(candidates, path)
 
 
-def _pick_rom_file(candidates: Iterable[Path]) -> Path | None:
-    """Best bootable file among `candidates`, by format preference then name
-    (which puts 'Disc 1' ahead of 'Disc 2' for a multi-disc set)."""
-    ranked: list[tuple[int, str, Path]] = []
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+    """Best bootable file among `candidates`, all of them somewhere under `base`.
+
+    Ranked by disc number, then format, then depth, then name:
+
+      * disc first, so a set starts on disc 1 whatever format the later discs
+        are in. Comparing the numbers also keeps 'Disc 2' ahead of 'Disc 10',
+        which sorting the names as text does not.
+      * format next, because among candidates for the same disc it decides
+        which disc image to boot.
+      * then depth, so the disc image sitting in the game folder wins over one
+        buried in an extras subfolder.
+    """
+    ranked: list[tuple[int, int, int, str, Path]] = []
     for p in candidates:
         if p.name.startswith("."):
             continue
@@ -206,14 +281,18 @@ def _pick_rom_file(candidates: Iterable[Path]) -> Path | None:
             # A symlink in the folder must not walk the launch out of
             # ROM_ROOT: _validate_rom_path only vetted the folder itself.
             real = p.resolve()
-        except OSError:
+            rel = p.relative_to(base)
+        except (OSError, ValueError):
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
-        ranked.append((ROM_EXTENSIONS.index(ext), p.name.lower(), real))
+        ranked.append(
+            (_disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts),
+             p.name.lower(), real)
+        )
     if not ranked:
         return None
-    return min(ranked)[2]
+    return min(ranked)[4]
 
 
 def _chown_abc(path: Path):
@@ -291,10 +370,12 @@ def _patch_ini(fullscreen: bool = False):
     # Section names are Dolphin's, not ours, and the two differ:
     #   MAIN_FOCUSED_HOTKEYS        [General] HotkeysRequireFocus  default True
     #   MAIN_INPUT_BACKGROUND_INPUT [Input]   BackgroundInput      default False
-    # Both defaults require the render window to hold focus, which it never
-    # does: Dolphin is an Xwayland client under labwc and the surface is not
-    # given keyboard focus. BackgroundInput lived under [General] until
-    # 2026-07-20, where Dolphin never read it.
+    # Both defaults require the render window to hold focus. It usually does —
+    # verified live, the Xwayland window holds X focus and _NET_ACTIVE_WINDOW —
+    # but only while a client is connected and driving labwc; keys injected
+    # with no stream attached, and keys arriving during a launch or a window
+    # swap, land outside that window. BackgroundInput lived under [General]
+    # until 2026-07-20, where Dolphin never read it.
     target = {
         "General": {
             "HotkeysRequireFocus": "False",
@@ -972,6 +1053,88 @@ def _pactl_get_mute() -> bool | None:
     if result.returncode != 0:
         return None
     return result.stdout.strip().endswith("yes")
+
+
+# The sink selkies streams to the browser. Its monitor, output.monitor, is what
+# pcmflux captures (selkies' audio_device_name default); anything Dolphin plays
+# into a different sink is inaudible in the stream.
+STREAM_SINK = "output"
+
+# Both null sinks the base image expects: "output" is streamed to the browser,
+# "input" backs the virtual microphone.
+_AUDIO_SINKS = (STREAM_SINK, "input")
+
+
+def _pactl_sink_names() -> list[str] | None:
+    """Return the names of all PulseAudio sinks, or None if pactl failed."""
+    result = _pactl("list", "short", "sinks")
+    if result.returncode != 0:
+        return None
+    # "index<TAB>name<TAB>driver<TAB>sample-spec<TAB>state"; sink names may
+    # contain spaces, so split on tabs rather than whitespace.
+    return [
+        parts[1] for parts in (line.split("\t") for line in result.stdout.splitlines())
+        if len(parts) >= 2
+    ]
+
+
+def _ensure_audio_sinks(timeout: float = 15.0) -> None:
+    """Create the null sinks svc-selkies may have failed to load, and pick one.
+
+    svc-selkies loads both sinks at container start behind a guard that waits
+    for PulseAudio's pid file:
+
+        until [ -f /defaults/pid ]; do sleep .5; done
+        pactl load-module module-null-sink sink_name="output" ...
+        pactl load-module module-null-sink sink_name="input" ...
+        touch /dev/shm/audio.lock
+
+    PulseAudio writes that pid file a few milliseconds *before* it accepts
+    connections on /defaults/native, so the first load-module can land in the
+    gap and die with "Connection refused" (observed live: pid file at
+    02:27:55.005, socket at 02:27:55.012, the failure at 02:27:55.012). The
+    "output" sink is then never created, the lock file suppresses any retry for
+    the life of the container, and every pcmflux start fails with
+    "pa_simple_new() failed: No such entity" — a permanently silent stream.
+
+    Called from main() after _wait_for_display(), which only returns once
+    selkies has brought up Xwayland, i.e. well past its own sink setup, so this
+    cannot race it into loading a duplicate module.
+    """
+    deadline = time.monotonic() + timeout
+    names = _pactl_sink_names()
+    while names is None and time.monotonic() < deadline:
+        time.sleep(0.5)
+        names = _pactl_sink_names()
+    if names is None:
+        log.warning("PulseAudio unreachable after %.0fs; leaving audio sinks alone", timeout)
+        return
+
+    for sink in _AUDIO_SINKS:
+        if sink in names:
+            continue
+        result = _pactl(
+            "load-module", "module-null-sink",
+            f"sink_name={sink}",
+            f"sink_properties=device.description={sink}",
+        )
+        if result.returncode != 0:
+            log.error("Could not create missing '%s' sink: %s", sink, result.stderr.strip())
+            continue
+        names.append(sink)
+        log.info("Created missing PulseAudio sink '%s' (svc-selkies lost its startup race)", sink)
+
+    # Dolphin plays to the default sink. When "output" is missing at the time
+    # svc-selkies runs, "input" becomes the default and Dolphin's audio ends up
+    # in the microphone loopback, which nothing streams — so the default has to
+    # be moved back even after the sink itself is restored.
+    if STREAM_SINK not in names:
+        return
+    current = _pactl("get-default-sink")
+    if current.returncode != 0 or current.stdout.strip() == STREAM_SINK:
+        return
+    if _pactl("set-default-sink", STREAM_SINK).returncode == 0:
+        log.info("Default sink set to '%s' (was '%s')", STREAM_SINK, current.stdout.strip())
 
 
 def _restart_selkies():
@@ -2158,6 +2321,11 @@ def main():
     # Only done once at startup, not on game launches, where webrtc_input is
     # already running and manages its own socket lifecycle.
     _cleanup_stale_sockets()
+
+    # Before the first launch: Dolphin picks its cubeb output device once, at
+    # startup, so a sink restored afterwards would not reach the running
+    # instance.
+    _ensure_audio_sinks()
 
     # Launch Dolphin into its main menu so the stream shows something useful
     # whenever no game is playing.  Game launches kill this instance first.

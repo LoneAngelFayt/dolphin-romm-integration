@@ -124,6 +124,28 @@ class RomFileResolution(unittest.TestCase):
         self._rom("gc/RE4/Disc 2/RE4.iso")
         self.assertEqual(broker._resolve_rom_file(self.root / "gc" / "RE4"), disc1)
 
+    def test_homebrew_executable_at_the_top_does_not_beat_a_nested_disc(self):
+        """A .dol loose in the game folder must not win just for being shallow:
+        the real discs are one level down in per-disc subfolders."""
+        disc1 = self._rom("gc/RE4/Disc 1/RE4 (Disc 1).rvz")
+        self._rom("gc/RE4/Disc 2/RE4 (Disc 2).rvz")
+        self._rom("gc/RE4/boot.dol")
+        self.assertEqual(broker._resolve_rom_file(self.root / "gc" / "RE4"), disc1)
+
+    def test_disc_one_wins_even_when_disc_two_is_a_better_format(self):
+        """Format preference decides which of two candidates for the *same*
+        disc to boot. It must not decide which disc to start on."""
+        disc1 = self._rom("gc/RE4/Disc 1/RE4.iso")
+        self._rom("gc/RE4/Disc 2/RE4.rvz")
+        self.assertEqual(broker._resolve_rom_file(self.root / "gc" / "RE4"), disc1)
+
+    def test_disc_two_beats_disc_ten(self):
+        """Disc order is numeric. Sorting the names as text puts 'Disc 10'
+        ahead of 'Disc 2', which starts a long set on the wrong disc."""
+        disc2 = self._rom("gc/Game/Game (Disc 2).iso")
+        self._rom("gc/Game/Game (Disc 10).iso")
+        self.assertEqual(broker._resolve_rom_file(self.root / "gc" / "Game"), disc2)
+
     def test_top_level_image_wins_over_a_nested_one(self):
         top = self._rom("gc/Game/Game.iso")
         self._rom("gc/Game/extras/bonus.iso")
