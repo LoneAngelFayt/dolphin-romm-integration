@@ -131,11 +131,14 @@ ENV = {
     **_gpu,
     **_glvnd_env(_gpu),
     "DISPLAY":            ":0",
-    # WAYLAND_DISPLAY intentionally omitted: if set, Dolphin's Vulkan backend
-    # creates a VK_KHR_wayland_surface and renders directly to the Wayland
-    # compositor, leaving the X11 window black.  Without it, Vulkan uses
-    # VK_KHR_xcb_surface and renders into the X11 window that Xwayland
-    # composites into labwc, which is what selkies captures.
+    # WAYLAND_DISPLAY intentionally omitted as a precaution: with it unset,
+    # Vulkan uses VK_KHR_xcb_surface and renders into the X11 window that
+    # Xwayland composites into labwc, which is what selkies captures (verified
+    # on the AMD reference host, identical to OpenGL). The concern with setting
+    # it is that Dolphin's Vulkan backend could bind a VK_KHR_wayland_surface
+    # instead and leave the X11 window black, but that has not been tested here
+    # and QT_QPA_PLATFORM=xcb already forces the render window to X11, so it is
+    # kept unset rather than relied upon either way.
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "QT_QPA_PLATFORM":    "xcb",
     "PULSE_RUNTIME_PATH": "/defaults",
