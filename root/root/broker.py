@@ -436,13 +436,15 @@ def _patch_ini(fullscreen: bool = False):
         },
     }
 
-    # Forced once, then left to the player. OpenGL is written into a fresh
-    # config so the first boot is guaranteed to render (Vulkan grabs the Wayland
-    # surface and black-screens the stream), and inserted if a pre-existing
-    # Dolphin.ini carries no backend at all so it cannot fall through to
-    # Dolphin's own default. Once the key is present it is never rewritten, so a
-    # backend the player picks in Dolphin's Graphics settings persists across
-    # sessions like every other in-app setting.
+    # Seeded once, then left to the player. OpenGL is written into a fresh
+    # config, and inserted if a pre-existing Dolphin.ini carries no backend at
+    # all, so the first boot lands on a backend known to be safe across GPUs
+    # rather than falling through to Dolphin's own default. Once the key is
+    # present it is never rewritten, so a backend the player picks in Dolphin's
+    # Graphics settings persists across sessions like every other in-app setting.
+    # OpenGL is the seed, not Vulkan, only because Vulkan is unverified on NVIDIA
+    # here; on the AMD reference host Vulkan renders to the X11 stream fine (the
+    # broker unsets WAYLAND_DISPLAY, so it uses the xcb surface, not Wayland).
     seed = {
         "Core": {"GFXBackend": "OpenGL"},
     }

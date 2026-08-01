@@ -105,8 +105,8 @@ class IniPatch(unittest.TestCase):
     # ── the backend is seeded once, then owned by the player ──────────────
 
     def test_a_fresh_config_is_seeded_with_opengl(self):
-        # OpenGL guarantees the first boot renders; Vulkan black-screens the
-        # Wayland stream.
+        # OpenGL is the backend known safe across GPUs, so a fresh config boots
+        # on it rather than falling through to Dolphin's own default.
         broker._patch_ini()
         self.assertEqual(parse_ini(self.read())["Core"]["GFXBackend"], "OpenGL")
 

@@ -178,7 +178,11 @@ The broker forces these on every launch, and they cannot be overridden from Dolp
 | `WAYLAND_DISPLAY` | *(unset)* | Set, Dolphin renders straight to Wayland and X11 stays black |
 | `Fullscreen` | `True` in game, `False` on the dashboard | Stops the idle boot going black |
 
-`GFXBackend` is seeded, not forced. The broker writes `OpenGL` into a fresh config so the first boot always renders (Vulkan drives the Wayland WSI when `WAYLAND_DISPLAY` is set and black-screens the X11 stream), and inserts it if an existing config carries no backend at all. After that the choice is yours: pick a backend in Dolphin's Graphics settings and it persists across sessions like any other in-app setting. The catch is that Vulkan black-screens the stream and the choice sticks, so the next launch stays black too. Recover by deleting the `GFXBackend` line from `[Core]` in `Dolphin.ini` (the broker reseeds `OpenGL`) or setting it back to `OpenGL` by hand.
+`GFXBackend` is seeded, not forced. The broker writes `OpenGL` into a fresh config, and inserts it if an existing config carries no backend at all, so the first boot always renders on a backend known to be safe across GPUs rather than falling through to whatever default Dolphin picks. After that the choice is yours: pick a backend in Dolphin's Graphics settings and it persists across sessions like any other in-app setting.
+
+Vulkan was tested on the AMD (radeonsi/radv) reference host and renders to the X11 stream fine, identical to OpenGL, because the broker unsets `WAYLAND_DISPLAY` so Vulkan uses the xcb surface rather than the Wayland WSI. It has not been tested on NVIDIA, where GPU selection has its own quirks (see the GLVND note below), so OpenGL stays the seeded default. If a backend you picked ever fails to render, delete the `GFXBackend` line from `[Core]` in `Dolphin.ini` (the broker reseeds `OpenGL`) or set it back to `OpenGL` by hand.
+
+Note that changing `GFXBackend` by editing `Dolphin.ini` while Dolphin is running has no effect: on the next launch the broker quits the live instance cleanly, which flushes its in-memory backend back over your edit before the seed patch runs. Change the backend from Dolphin's own Graphics settings instead, which is what persistence is built around.
 
 ### Graphics environment
 
