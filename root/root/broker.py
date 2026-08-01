@@ -424,7 +424,6 @@ def _patch_ini(fullscreen: bool = False):
             "SIDevice1": "0",
             "SIDevice2": "0",
             "SIDevice3": "0",
-            "GFXBackend": "OpenGL",
             "CPUThread": "False",
             "SlotA": str(EXI_MEMORY_CARD_FOLDER),
             "GCIFolderAPathOverride": card_dir,
@@ -437,11 +436,26 @@ def _patch_ini(fullscreen: bool = False):
         },
     }
 
+    # Forced once, then left to the player. OpenGL is written into a fresh
+    # config so the first boot is guaranteed to render (Vulkan grabs the Wayland
+    # surface and black-screens the stream), and inserted if a pre-existing
+    # Dolphin.ini carries no backend at all so it cannot fall through to
+    # Dolphin's own default. Once the key is present it is never rewritten, so a
+    # backend the player picks in Dolphin's Graphics settings persists across
+    # sessions like every other in-app setting.
+    seed = {
+        "Core": {"GFXBackend": "OpenGL"},
+    }
+
     try:
         lines = INI_PATH.read_text().splitlines()
         current_section: str | None = None
         applied: dict[str, set] = {s: set() for s in target}
+        seed_present: dict[str, set] = {s: set() for s in seed}
         new_lines = []
+
+        def _key_here(stripped: str, key: str) -> bool:
+            return stripped.startswith(f"{key} =") or stripped.startswith(f"{key}=")
 
         for line in lines:
             stripped = line.strip()
@@ -450,9 +464,16 @@ def _patch_ini(fullscreen: bool = False):
                 new_lines.append(line)
                 continue
 
+            # Record a seed key already in the file so it is neither reinserted
+            # nor overwritten: whatever the player set is left exactly as is.
+            if current_section in seed:
+                for key in seed[current_section]:
+                    if _key_here(stripped, key):
+                        seed_present[current_section].add(key)
+
             if current_section in target:
                 for key, val in target[current_section].items():
-                    if stripped.startswith(f"{key} =") or stripped.startswith(f"{key}="):
+                    if _key_here(stripped, key):
                         new_lines.append(f"{key} = {val}")
                         applied[current_section].add(key)
                         break
@@ -464,22 +485,31 @@ def _patch_ini(fullscreen: bool = False):
         # Insert missing keys under their existing section header; only create
         # the section if the file doesn't have it at all. Blindly appending a
         # second [section] block at EOF accumulates duplicate headers.
-        for section, keys in target.items():
-            missing = {k: v for k, v in keys.items() if k not in applied[section]}
-            if not missing:
-                continue
+        def _insert(section: str, kv: dict[str, str]) -> None:
+            if not kv:
+                return
             header_idx = next(
                 (i for i, line in enumerate(new_lines) if line.strip() == f"[{section}]"),
                 None,
             )
-            add_lines = [f"{k} = {v}" for k, v in missing.items()]
+            add_lines = [f"{k} = {v}" for k, v in kv.items()]
             if header_idx is None:
                 new_lines.append(f"[{section}]")
                 new_lines.extend(add_lines)
             else:
                 new_lines[header_idx + 1:header_idx + 1] = add_lines
+
+        for section, keys in target.items():
+            missing = {k: v for k, v in keys.items() if k not in applied[section]}
+            _insert(section, missing)
             for k in missing:
                 log.warning("Dolphin.ini: [%s] %s not found, inserted", section, k)
+
+        for section, keys in seed.items():
+            missing = {k: v for k, v in keys.items() if k not in seed_present[section]}
+            _insert(section, missing)
+            for k in missing:
+                log.info("Dolphin.ini: seeded [%s] %s once, kept thereafter", section, k)
 
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")

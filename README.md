@@ -173,11 +173,12 @@ The broker forces these on every launch, and they cannot be overridden from Dolp
 
 | Setting | Value | Why |
 |---|---|---|
-| `GFXBackend` | `OpenGL` | Vulkan switches to Wayland WSI when `WAYLAND_DISPLAY` is set, bypassing X11 |
 | `RenderToMain` | `False` | `True` creates an unmapped render window in this build |
 | `QT_QPA_PLATFORM` | `xcb` | Without it Qt takes a broken Wayland path |
 | `WAYLAND_DISPLAY` | *(unset)* | Set, Dolphin renders straight to Wayland and X11 stays black |
 | `Fullscreen` | `True` in game, `False` on the dashboard | Stops the idle boot going black |
+
+`GFXBackend` is seeded, not forced. The broker writes `OpenGL` into a fresh config so the first boot always renders (Vulkan drives the Wayland WSI when `WAYLAND_DISPLAY` is set and black-screens the X11 stream), and inserts it if an existing config carries no backend at all. After that the choice is yours: pick a backend in Dolphin's Graphics settings and it persists across sessions like any other in-app setting. The catch is that Vulkan black-screens the stream and the choice sticks, so the next launch stays black too. Recover by deleting the `GFXBackend` line from `[Core]` in `Dolphin.ini` (the broker reseeds `OpenGL`) or setting it back to `OpenGL` by hand.
 
 ### Graphics environment
 
@@ -196,7 +197,7 @@ Main Stick/Calibration = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
 C-Stick/Calibration    = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
 ```
 
-Mapping and calibration live in `/config` and survive game switches. One catch: Dolphin does not save controller settings on exit, so you have to click **Close** (not just OK) in its controller dialog for changes to reach disk.
+Mapping and calibration live in `/config` and survive game switches. Because the broker quits Dolphin cleanly on teardown, changes you make in its controller dialog are flushed to disk on exit, the same way graphics settings now persist.
 
 ## Troubleshooting
 

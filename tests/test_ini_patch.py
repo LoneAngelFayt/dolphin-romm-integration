@@ -94,14 +94,48 @@ class IniPatch(unittest.TestCase):
     def test_overwrites_existing_wrong_values(self):
         self.ini.parent.mkdir(parents=True)
         self.ini.write_text(
-            "[Core]\nGFXBackend = Vulkan\nCPUThread = True\n"
+            "[Core]\nCPUThread = True\n"
             "[Interface]\nConfirmStop = True\n"
         )
         broker._patch_ini()
         cfg = parse_ini(self.read())
-        self.assertEqual(cfg["Core"]["GFXBackend"], "OpenGL")
         self.assertEqual(cfg["Core"]["CPUThread"], "False")
         self.assertEqual(cfg["Interface"]["ConfirmStop"], "False")
+
+    # ── the backend is seeded once, then owned by the player ──────────────
+
+    def test_a_fresh_config_is_seeded_with_opengl(self):
+        # OpenGL guarantees the first boot renders; Vulkan black-screens the
+        # Wayland stream.
+        broker._patch_ini()
+        self.assertEqual(parse_ini(self.read())["Core"]["GFXBackend"], "OpenGL")
+
+    def test_a_backend_the_player_picked_is_not_reset(self):
+        # The whole point of the change: a value chosen in Dolphin's Graphics
+        # settings must survive the next launch's ini patch.
+        self.ini.parent.mkdir(parents=True)
+        self.ini.write_text("[Core]\nGFXBackend = Vulkan\nCPUThread = True\n")
+        broker._patch_ini()
+        cfg = parse_ini(self.read())
+        self.assertEqual(cfg["Core"]["GFXBackend"], "Vulkan")
+        self.assertEqual(cfg["Core"]["CPUThread"], "False")  # still forced
+
+    def test_a_pre_existing_config_without_a_backend_is_seeded(self):
+        # An older Dolphin.ini with no GFXBackend must not fall through to
+        # Dolphin's own default, which may be Vulkan.
+        self.ini.parent.mkdir(parents=True)
+        self.ini.write_text("[Core]\nCPUThread = True\n")
+        broker._patch_ini()
+        self.assertEqual(parse_ini(self.read())["Core"]["GFXBackend"], "OpenGL")
+
+    def test_the_backend_is_never_duplicated_across_launches(self):
+        broker._patch_ini()
+        for _ in range(3):
+            broker._patch_ini()
+        core_backends = [
+            ln for ln in self.read().splitlines() if ln.strip().startswith("GFXBackend")
+        ]
+        self.assertEqual(len(core_backends), 1, core_backends)
 
     def test_preserves_unrelated_keys(self):
         self.ini.parent.mkdir(parents=True)
