@@ -179,6 +179,12 @@ The broker forces these on every launch, and they cannot be overridden from Dolp
 | `WAYLAND_DISPLAY` | *(unset)* | Set, Dolphin renders straight to Wayland and X11 stays black |
 | `Fullscreen` | `True` in game, `False` on the dashboard | Stops the idle boot going black |
 
+### Graphics environment
+
+`sudo` resets the environment before launching Dolphin, so the broker forwards graphics variables through explicitly. Anything the operator sets on the container in the vendor namespaces (`NVIDIA_*`, `VK_*`, `MESA_*`, `LIBGL_*`, `GALLIUM_*`, `RADV_*`, `AMD_*`, `DRI_*`, `LIBVA_*`, `VDPAU_*`, `__GLX_*`, `__NV_*`, `__EGL_*`, `__VK_*`), plus `XDG_DATA_DIRS` and the base image's `DRINODE`, reaches Dolphin. Empty values are dropped rather than forwarded as blanks.
+
+On an NVIDIA host the broker also pins `__GLX_VENDOR_LIBRARY_NAME=nvidia` (and the NVIDIA EGL ICD when its file is present) so GL vendor selection does not depend on udev. The gamepad interposer's fake libudev hides the NVIDIA device from GLVND's udev lookup, which otherwise drops the renderer to Mesa's `llvmpipe`; Mesa-native drivers (AMD/Intel) have a direct render-node fallback and are left alone. A value the operator set themselves always wins.
+
 ## Controllers
 
 Browser gamepad input reaches the container through the [selkies joystick interposer](https://github.com/selkies-project/selkies-gstreamer) as virtual Xbox 360 pads (`SDL/0-3/Microsoft X-Box 360 pad`). All four GCPad ports are mapped to it on first launch, seeded from `/defaults/GCPadNew.ini` only when no config exists, so your own mappings are never overwritten.

@@ -93,9 +93,43 @@ def _gpu_env() -> dict[str, str]:
     }
 
 
+def _nvidia_present() -> bool:
+    """True when an NVIDIA GPU is passed into the container."""
+    return Path("/dev/nvidiactl").exists() or Path("/dev/nvidia0").exists()
+
+
+# The NVIDIA EGL ICD, present only when the NVIDIA userspace is installed. It is
+# the ICD the loader would otherwise have to find by udev device correlation,
+# which is the step the fake libudev breaks.
+_NVIDIA_EGL_ICD = Path("/usr/share/glvnd/egl_vendor.d/10_nvidia.json")
+
+
+def _glvnd_env(already_set: dict) -> dict:
+    """Pin GLVND to the NVIDIA vendor so GL selection does not consult udev.
+
+    On NVIDIA the fake libudev (loaded for the gamepad interposer) advertises no
+    NVIDIA device, so GLVND cannot correlate the DRM node and falls back to Mesa
+    swrast (llvmpipe). Naming the vendor outright skips that lookup entirely.
+    Skipped on non-NVIDIA hosts, where forcing the nvidia vendor would break a
+    working Mesa driver, and never overrides a value the operator set."""
+    if not _nvidia_present():
+        return {}
+    env = {}
+    if "__GLX_VENDOR_LIBRARY_NAME" not in already_set:
+        env["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
+    # Only pin the EGL ICD when its file is actually there: pointing the loader
+    # at a missing filename disables every other ICD and breaks EGL outright.
+    if "__EGL_VENDOR_LIBRARY_FILENAMES" not in already_set and _NVIDIA_EGL_ICD.exists():
+        env["__EGL_VENDOR_LIBRARY_FILENAMES"] = str(_NVIDIA_EGL_ICD)
+    return env
+
+
+_gpu = _gpu_env()
 ENV = {
-    # Inherited GPU vars come first so the explicit entries below always win.
-    **_gpu_env(),
+    # Operator GPU knobs first, then our NVIDIA GLVND defaults for the names the
+    # operator did not set, then the fixed entries below, which always win.
+    **_gpu,
+    **_glvnd_env(_gpu),
     "DISPLAY":            ":0",
     # WAYLAND_DISPLAY intentionally omitted: if set, Dolphin's Vulkan backend
     # creates a VK_KHR_wayland_surface and renders directly to the Wayland
@@ -148,6 +182,8 @@ else:
         "ICD was never injected (check NVIDIA_DRIVER_CAPABILITIES includes 'graphics'); "
         "NVIDIA present means the failure is at surface creation instead."
     )
+if _nvidia_present():
+    log.info("NVIDIA GPU detected; pinned GLVND vendor so GL selection skips udev.")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 

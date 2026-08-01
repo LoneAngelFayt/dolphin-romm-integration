@@ -7,6 +7,8 @@ from the outside like the container ignoring its own configuration.
 """
 
 import os
+import pathlib
+import tempfile
 import unittest
 import unittest.mock as mock
 
@@ -63,6 +65,45 @@ class GpuEnvTests(unittest.TestCase):
         an inherited value must not undo either."""
         self.assertEqual(broker.ENV["DISPLAY"], ":0")
         self.assertNotIn("WAYLAND_DISPLAY", broker.ENV)
+
+
+class GlvndPin(unittest.TestCase):
+    """Issue #7: the gamepad interposer's fake libudev hides the NVIDIA device
+    from GLVND's udev lookup, dropping the renderer to llvmpipe. Naming the
+    vendor outright is the fix, but only on NVIDIA and never over an operator's
+    own choice."""
+
+    def test_nothing_is_pinned_off_nvidia(self):
+        # Forcing the nvidia vendor on an AMD/Intel host would break a working
+        # Mesa driver, which is exactly the platform where the fake libudev is
+        # already harmless.
+        with mock.patch.object(broker, "_nvidia_present", lambda: False):
+            self.assertEqual(broker._glvnd_env({}), {})
+
+    def test_the_glx_vendor_is_pinned_on_nvidia(self):
+        with mock.patch.object(broker, "_nvidia_present", lambda: True), \
+             mock.patch.object(broker, "_NVIDIA_EGL_ICD", pathlib.Path("/nope.json")):
+            self.assertEqual(
+                broker._glvnd_env({}), {"__GLX_VENDOR_LIBRARY_NAME": "nvidia"}
+            )
+
+    def test_an_operator_vendor_choice_is_never_overridden(self):
+        with mock.patch.object(broker, "_nvidia_present", lambda: True), \
+             mock.patch.object(broker, "_NVIDIA_EGL_ICD", pathlib.Path("/nope.json")):
+            self.assertEqual(
+                broker._glvnd_env({"__GLX_VENDOR_LIBRARY_NAME": "mesa"}), {}
+            )
+
+    def test_the_egl_icd_is_pinned_only_when_its_file_exists(self):
+        # Pointing the loader at a missing filename disables every other ICD and
+        # breaks EGL outright, so the pin is conditional on the file being there.
+        with mock.patch.object(broker, "_nvidia_present", lambda: True):
+            with tempfile.NamedTemporaryFile(suffix=".json") as f:
+                with mock.patch.object(broker, "_NVIDIA_EGL_ICD", pathlib.Path(f.name)):
+                    self.assertEqual(
+                        broker._glvnd_env({}).get("__EGL_VENDOR_LIBRARY_FILENAMES"),
+                        f.name,
+                    )
 
 
 if __name__ == "__main__":
