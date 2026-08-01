@@ -498,8 +498,42 @@ def _patch_ini(fullscreen: bool = False):
             pass
 
 
+QUIT_WAIT = float(os.environ.get("QUIT_WAIT", "6.0"))
+
+
+def _graceful_quit(proc, timeout: float = QUIT_WAIT) -> bool:
+    """Ask Dolphin to close itself so it flushes its own config to disk.
+
+    While a game is running Dolphin keeps GUI graphics changes (aspect ratio,
+    internal resolution, and the rest of GFX.ini) in a runtime config layer and
+    only writes them out on a clean Qt shutdown. A group SIGTERM skips that
+    flush, so anything the player changed in the Graphics dialog is discarded on
+    the next launch. Sending Alt+F4 to the window drives the clean-close path
+    instead; ConfirmStop=False (pinned in Dolphin.ini) means it exits without a
+    "Stop emulation?" prompt. Returns True if Dolphin exited on its own within
+    the timeout, False if it now has to be signalled.
+    """
+    wid = _xdotool_find_window()
+    if wid is None:
+        return False
+    if not _xdotool_key(wid, "alt+F4"):
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            log.info("Dolphin quit cleanly on Alt+F4 (config flushed)")
+            return True
+        time.sleep(0.2)
+    log.warning("Dolphin did not quit within %.1fs of Alt+F4: falling back to signals", timeout)
+    return False
+
+
 def _kill_dolphin():
-    """Kill the managed dolphin-emu process group."""
+    """Stop the managed dolphin-emu process.
+
+    Tries a graceful Alt+F4 quit first so Dolphin persists its own config
+    (see _graceful_quit), then falls back to a group SIGTERM/SIGKILL.
+    """
     with _session_lock:
         _session["is_managed"] = False
         proc = _session["process"]
@@ -512,6 +546,8 @@ def _kill_dolphin():
         return
 
     log.info("Stopping Dolphin (PID %d)...", proc.pid)
+    if _graceful_quit(proc):
+        return
     try:
         pgid = os.getpgid(proc.pid)
         os.killpg(pgid, signal.SIGTERM)
