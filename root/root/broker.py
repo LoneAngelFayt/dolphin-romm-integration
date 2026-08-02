@@ -103,6 +103,23 @@ def _nvidia_present() -> bool:
 # which is the step the fake libudev breaks.
 _NVIDIA_EGL_ICD = Path("/usr/share/glvnd/egl_vendor.d/10_nvidia.json")
 
+# The GLX half of that userspace. The container runtime mounts it only when
+# NVIDIA_DRIVER_CAPABILITIES asks for 'graphics', and where it lands depends on
+# the image's ldconfig layout, so every candidate directory is checked.
+_NVIDIA_GLX_LIB = "libGLX_nvidia.so.0"
+_NVIDIA_LIB_DIRS = ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib")
+
+
+def _nvidia_glx_present() -> bool:
+    """True when the NVIDIA GLX vendor library is actually in this container.
+
+    A device node does not imply it. NVIDIA_DRIVER_CAPABILITIES=utility passes
+    /dev/nvidiactl through and makes nvidia-smi work while injecting no GL
+    userspace at all, which is a common way to write a compose file for a card
+    that was only ever meant to transcode.
+    """
+    return any(Path(d, _NVIDIA_GLX_LIB).exists() for d in _NVIDIA_LIB_DIRS)
+
 
 def _glvnd_env(already_set: dict) -> dict:
     """Pin GLVND to the NVIDIA vendor so GL selection does not consult udev.
@@ -111,11 +128,18 @@ def _glvnd_env(already_set: dict) -> dict:
     NVIDIA device, so GLVND cannot correlate the DRM node and falls back to Mesa
     swrast (llvmpipe). Naming the vendor outright skips that lookup entirely.
     Skipped on non-NVIDIA hosts, where forcing the nvidia vendor would break a
-    working Mesa driver, and never overrides a value the operator set."""
+    working Mesa driver, and never overrides a value the operator set.
+
+    Both pins are conditional on the vendor library they name being present.
+    Naming a GLX vendor GLVND cannot load does not fall back to Mesa, it breaks
+    GLX outright, so a half-injected NVIDIA userspace would cost every GL client
+    its context. The Qt menu is not a GL client and survives that, which is why
+    it surfaces as "the emulator dies on boot but the dashboard is fine".
+    """
     if not _nvidia_present():
         return {}
     env = {}
-    if "__GLX_VENDOR_LIBRARY_NAME" not in already_set:
+    if "__GLX_VENDOR_LIBRARY_NAME" not in already_set and _nvidia_glx_present():
         env["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
     # Only pin the EGL ICD when its file is actually there: pointing the loader
     # at a missing filename disables every other ICD and breaks EGL outright.
@@ -185,8 +209,16 @@ else:
         "ICD was never injected (check NVIDIA_DRIVER_CAPABILITIES includes 'graphics'); "
         "NVIDIA present means the failure is at surface creation instead."
     )
-if _nvidia_present():
+if _nvidia_present() and _nvidia_glx_present():
     log.info("NVIDIA GPU detected; pinned GLVND vendor so GL selection skips udev.")
+elif _nvidia_present():
+    log.warning(
+        "NVIDIA device present but %s is not in this container, so the GLVND vendor pin "
+        "was skipped and GL falls back to Mesa. nvidia-smi working does not mean the GL "
+        "userspace was injected: add 'graphics' to NVIDIA_DRIVER_CAPABILITIES (or set it "
+        "to 'all') and recreate the container.",
+        _NVIDIA_GLX_LIB,
+    )
 
 # ── Session state ─────────────────────────────────────────────────────────────
 

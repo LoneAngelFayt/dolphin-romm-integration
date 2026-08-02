@@ -82,17 +82,47 @@ class GlvndPin(unittest.TestCase):
 
     def test_the_glx_vendor_is_pinned_on_nvidia(self):
         with mock.patch.object(broker, "_nvidia_present", lambda: True), \
+             mock.patch.object(broker, "_nvidia_glx_present", lambda: True), \
              mock.patch.object(broker, "_NVIDIA_EGL_ICD", pathlib.Path("/nope.json")):
             self.assertEqual(
                 broker._glvnd_env({}), {"__GLX_VENDOR_LIBRARY_NAME": "nvidia"}
             )
 
+    def test_the_glx_vendor_is_not_pinned_without_its_vendor_library(self):
+        # A device node says nothing about the GL userspace: nvidia-smi works on
+        # NVIDIA_DRIVER_CAPABILITIES=utility, where libGLX_nvidia.so.0 was never
+        # mounted. Naming a vendor GLVND cannot load breaks GLX for every client,
+        # which on a container whose only GL client is the emulator means the Qt
+        # menu survives and every game dies on context creation.
+        with mock.patch.object(broker, "_nvidia_present", lambda: True), \
+             mock.patch.object(broker, "_nvidia_glx_present", lambda: False), \
+             mock.patch.object(broker, "_NVIDIA_EGL_ICD", pathlib.Path("/nope.json")):
+            self.assertEqual(broker._glvnd_env({}), {})
+
     def test_an_operator_vendor_choice_is_never_overridden(self):
         with mock.patch.object(broker, "_nvidia_present", lambda: True), \
+             mock.patch.object(broker, "_nvidia_glx_present", lambda: True), \
              mock.patch.object(broker, "_NVIDIA_EGL_ICD", pathlib.Path("/nope.json")):
             self.assertEqual(
                 broker._glvnd_env({"__GLX_VENDOR_LIBRARY_NAME": "mesa"}), {}
             )
+
+    def test_the_vendor_library_is_looked_for_in_every_lib_dir(self):
+        # The container runtime places the driver libraries wherever the image's
+        # ldconfig points, which differs between the multiarch and lib64 layouts.
+        for lib_dir in broker._NVIDIA_LIB_DIRS:
+            with tempfile.TemporaryDirectory() as tmp:
+                (pathlib.Path(tmp) / broker._NVIDIA_GLX_LIB).touch()
+                dirs = tuple(
+                    tmp if d == lib_dir else "/nonexistent"
+                    for d in broker._NVIDIA_LIB_DIRS
+                )
+                with mock.patch.object(broker, "_NVIDIA_LIB_DIRS", dirs):
+                    self.assertTrue(broker._nvidia_glx_present())
+
+    def test_no_vendor_library_anywhere_reads_as_absent(self):
+        with mock.patch.object(broker, "_NVIDIA_LIB_DIRS", ("/nonexistent",)):
+            self.assertFalse(broker._nvidia_glx_present())
 
     def test_the_egl_icd_is_pinned_only_when_its_file_exists(self):
         # Pointing the loader at a missing filename disables every other ICD and
