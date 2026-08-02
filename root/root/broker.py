@@ -93,15 +93,52 @@ def _gpu_env() -> dict[str, str]:
     }
 
 
+def _nvidia_present() -> bool:
+    """True when an NVIDIA GPU is passed into the container."""
+    return Path("/dev/nvidiactl").exists() or Path("/dev/nvidia0").exists()
+
+
+# The NVIDIA EGL ICD, present only when the NVIDIA userspace is installed. It is
+# the ICD the loader would otherwise have to find by udev device correlation,
+# which is the step the fake libudev breaks.
+_NVIDIA_EGL_ICD = Path("/usr/share/glvnd/egl_vendor.d/10_nvidia.json")
+
+
+def _glvnd_env(already_set: dict) -> dict:
+    """Pin GLVND to the NVIDIA vendor so GL selection does not consult udev.
+
+    On NVIDIA the fake libudev (loaded for the gamepad interposer) advertises no
+    NVIDIA device, so GLVND cannot correlate the DRM node and falls back to Mesa
+    swrast (llvmpipe). Naming the vendor outright skips that lookup entirely.
+    Skipped on non-NVIDIA hosts, where forcing the nvidia vendor would break a
+    working Mesa driver, and never overrides a value the operator set."""
+    if not _nvidia_present():
+        return {}
+    env = {}
+    if "__GLX_VENDOR_LIBRARY_NAME" not in already_set:
+        env["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
+    # Only pin the EGL ICD when its file is actually there: pointing the loader
+    # at a missing filename disables every other ICD and breaks EGL outright.
+    if "__EGL_VENDOR_LIBRARY_FILENAMES" not in already_set and _NVIDIA_EGL_ICD.exists():
+        env["__EGL_VENDOR_LIBRARY_FILENAMES"] = str(_NVIDIA_EGL_ICD)
+    return env
+
+
+_gpu = _gpu_env()
 ENV = {
-    # Inherited GPU vars come first so the explicit entries below always win.
-    **_gpu_env(),
+    # Operator GPU knobs first, then our NVIDIA GLVND defaults for the names the
+    # operator did not set, then the fixed entries below, which always win.
+    **_gpu,
+    **_glvnd_env(_gpu),
     "DISPLAY":            ":0",
-    # WAYLAND_DISPLAY intentionally omitted: if set, Dolphin's Vulkan backend
-    # creates a VK_KHR_wayland_surface and renders directly to the Wayland
-    # compositor, leaving the X11 window black.  Without it, Vulkan uses
-    # VK_KHR_xcb_surface and renders into the X11 window that Xwayland
-    # composites into labwc, which is what selkies captures.
+    # WAYLAND_DISPLAY intentionally omitted as a precaution: with it unset,
+    # Vulkan uses VK_KHR_xcb_surface and renders into the X11 window that
+    # Xwayland composites into labwc, which is what selkies captures (verified
+    # on the AMD reference host, identical to OpenGL). The concern with setting
+    # it is that Dolphin's Vulkan backend could bind a VK_KHR_wayland_surface
+    # instead and leave the X11 window black, but that has not been tested here
+    # and QT_QPA_PLATFORM=xcb already forces the render window to X11, so it is
+    # kept unset rather than relied upon either way.
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "QT_QPA_PLATFORM":    "xcb",
     "PULSE_RUNTIME_PATH": "/defaults",
@@ -148,6 +185,8 @@ else:
         "ICD was never injected (check NVIDIA_DRIVER_CAPABILITIES includes 'graphics'); "
         "NVIDIA present means the failure is at surface creation instead."
     )
+if _nvidia_present():
+    log.info("NVIDIA GPU detected; pinned GLVND vendor so GL selection skips udev.")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -388,7 +427,6 @@ def _patch_ini(fullscreen: bool = False):
             "SIDevice1": "0",
             "SIDevice2": "0",
             "SIDevice3": "0",
-            "GFXBackend": "OpenGL",
             "CPUThread": "False",
             "SlotA": str(EXI_MEMORY_CARD_FOLDER),
             "GCIFolderAPathOverride": card_dir,
@@ -401,11 +439,28 @@ def _patch_ini(fullscreen: bool = False):
         },
     }
 
+    # Seeded once, then left to the player. OpenGL is written into a fresh
+    # config, and inserted if a pre-existing Dolphin.ini carries no backend at
+    # all, so the first boot lands on a backend known to be safe across GPUs
+    # rather than falling through to Dolphin's own default. Once the key is
+    # present it is never rewritten, so a backend the player picks in Dolphin's
+    # Graphics settings persists across sessions like every other in-app setting.
+    # OpenGL is the seed, not Vulkan, only because Vulkan is unverified on NVIDIA
+    # here; on the AMD reference host Vulkan renders to the X11 stream fine (the
+    # broker unsets WAYLAND_DISPLAY, so it uses the xcb surface, not Wayland).
+    seed = {
+        "Core": {"GFXBackend": "OpenGL"},
+    }
+
     try:
         lines = INI_PATH.read_text().splitlines()
         current_section: str | None = None
         applied: dict[str, set] = {s: set() for s in target}
+        seed_present: dict[str, set] = {s: set() for s in seed}
         new_lines = []
+
+        def _key_here(stripped: str, key: str) -> bool:
+            return stripped.startswith(f"{key} =") or stripped.startswith(f"{key}=")
 
         for line in lines:
             stripped = line.strip()
@@ -414,9 +469,16 @@ def _patch_ini(fullscreen: bool = False):
                 new_lines.append(line)
                 continue
 
+            # Record a seed key already in the file so it is neither reinserted
+            # nor overwritten: whatever the player set is left exactly as is.
+            if current_section in seed:
+                for key in seed[current_section]:
+                    if _key_here(stripped, key):
+                        seed_present[current_section].add(key)
+
             if current_section in target:
                 for key, val in target[current_section].items():
-                    if stripped.startswith(f"{key} =") or stripped.startswith(f"{key}="):
+                    if _key_here(stripped, key):
                         new_lines.append(f"{key} = {val}")
                         applied[current_section].add(key)
                         break
@@ -428,22 +490,31 @@ def _patch_ini(fullscreen: bool = False):
         # Insert missing keys under their existing section header; only create
         # the section if the file doesn't have it at all. Blindly appending a
         # second [section] block at EOF accumulates duplicate headers.
-        for section, keys in target.items():
-            missing = {k: v for k, v in keys.items() if k not in applied[section]}
-            if not missing:
-                continue
+        def _insert(section: str, kv: dict[str, str]) -> None:
+            if not kv:
+                return
             header_idx = next(
                 (i for i, line in enumerate(new_lines) if line.strip() == f"[{section}]"),
                 None,
             )
-            add_lines = [f"{k} = {v}" for k, v in missing.items()]
+            add_lines = [f"{k} = {v}" for k, v in kv.items()]
             if header_idx is None:
                 new_lines.append(f"[{section}]")
                 new_lines.extend(add_lines)
             else:
                 new_lines[header_idx + 1:header_idx + 1] = add_lines
+
+        for section, keys in target.items():
+            missing = {k: v for k, v in keys.items() if k not in applied[section]}
+            _insert(section, missing)
             for k in missing:
                 log.warning("Dolphin.ini: [%s] %s not found, inserted", section, k)
+
+        for section, keys in seed.items():
+            missing = {k: v for k, v in keys.items() if k not in seed_present[section]}
+            _insert(section, missing)
+            for k in missing:
+                log.info("Dolphin.ini: seeded [%s] %s once, kept thereafter", section, k)
 
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
@@ -462,8 +533,42 @@ def _patch_ini(fullscreen: bool = False):
             pass
 
 
+QUIT_WAIT = float(os.environ.get("QUIT_WAIT", "6.0"))
+
+
+def _graceful_quit(proc, timeout: float = QUIT_WAIT) -> bool:
+    """Ask Dolphin to close itself so it flushes its own config to disk.
+
+    While a game is running Dolphin keeps GUI graphics changes (aspect ratio,
+    internal resolution, and the rest of GFX.ini) in a runtime config layer and
+    only writes them out on a clean Qt shutdown. A group SIGTERM skips that
+    flush, so anything the player changed in the Graphics dialog is discarded on
+    the next launch. Sending Alt+F4 to the window drives the clean-close path
+    instead; ConfirmStop=False (pinned in Dolphin.ini) means it exits without a
+    "Stop emulation?" prompt. Returns True if Dolphin exited on its own within
+    the timeout, False if it now has to be signalled.
+    """
+    wid = _xdotool_find_window()
+    if wid is None:
+        return False
+    if not _xdotool_key(wid, "alt+F4"):
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            log.info("Dolphin quit cleanly on Alt+F4 (config flushed)")
+            return True
+        time.sleep(0.2)
+    log.warning("Dolphin did not quit within %.1fs of Alt+F4: falling back to signals", timeout)
+    return False
+
+
 def _kill_dolphin():
-    """Kill the managed dolphin-emu process group."""
+    """Stop the managed dolphin-emu process.
+
+    Tries a graceful Alt+F4 quit first so Dolphin persists its own config
+    (see _graceful_quit), then falls back to a group SIGTERM/SIGKILL.
+    """
     with _session_lock:
         _session["is_managed"] = False
         proc = _session["process"]
@@ -476,6 +581,8 @@ def _kill_dolphin():
         return
 
     log.info("Stopping Dolphin (PID %d)...", proc.pid)
+    if _graceful_quit(proc):
+        return
     try:
         pgid = os.getpgid(proc.pid)
         os.killpg(pgid, signal.SIGTERM)

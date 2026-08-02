@@ -22,6 +22,7 @@ dir through the `SSTATE_DIR`, `SAVE_DATA_ROOT` and `GCI_CARD_DIR` overrides.
 | `test_hardening.py` | Zip bombs, planted symlinks, unreadable members, spooling, interrupted card swaps |
 | `test_process_lifecycle.py` | Crash-relaunch backoff and cap, launch serialisation, the display wait |
 | `test_audio_sinks.py` | Recreating the null sinks svc-selkies drops, and where the default sink points |
+| `test_gpu_env.py` | Graphics-env forwarding through the sudo hop and the NVIDIA GLVND pin |
 | `test_packaging.py` | s6 wiring, sudoers coverage, and drift between `init.sh` and `broker.py` |
 
 `test_packaging.py` is the early-warning half. It reads `broker.py` and

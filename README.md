@@ -169,15 +169,26 @@ Dolphin savestates carry no embedded frame, so the broker takes one: the screens
 
 ### Display settings
 
-The broker forces these on every launch, and they cannot be overridden from Dolphin's GUI. They exist because selkies captures X11, and Dolphin will happily bypass X11 given the chance.
+The broker forces these on every launch, and they cannot be overridden from Dolphin's GUI. They exist because selkies only captures the X11 display, so anything that could pull Dolphin's output onto a different display path is closed off.
 
 | Setting | Value | Why |
 |---|---|---|
-| `GFXBackend` | `OpenGL` | Vulkan switches to Wayland WSI when `WAYLAND_DISPLAY` is set, bypassing X11 |
 | `RenderToMain` | `False` | `True` creates an unmapped render window in this build |
 | `QT_QPA_PLATFORM` | `xcb` | Without it Qt takes a broken Wayland path |
-| `WAYLAND_DISPLAY` | *(unset)* | Set, Dolphin renders straight to Wayland and X11 stays black |
+| `WAYLAND_DISPLAY` | *(unset)* | Stripped as a precaution so Dolphin stays on the X11 render path selkies captures; the "if set" behavior is unverified |
 | `Fullscreen` | `True` in game, `False` on the dashboard | Stops the idle boot going black |
+
+`GFXBackend` is seeded, not forced. The broker writes `OpenGL` into a fresh config, and inserts it if an existing config carries no backend at all, so the first boot always renders on a backend known to be safe across GPUs rather than falling through to whatever default Dolphin picks. After that the choice is yours: pick a backend in Dolphin's Graphics settings and it persists across sessions like any other in-app setting.
+
+Vulkan was tested on the AMD (radeonsi/radv) reference host and renders to the X11 stream fine, identical to OpenGL. It has not been tested on NVIDIA, where GPU selection has its own quirks (see the GLVND note below), so OpenGL stays the seeded default. If a backend you picked ever fails to render, delete the `GFXBackend` line from `[Core]` in `Dolphin.ini` (the broker reseeds `OpenGL`) or set it back to `OpenGL` by hand.
+
+Note that changing `GFXBackend` by editing `Dolphin.ini` while Dolphin is running has no effect: on the next launch the broker quits the live instance cleanly, which flushes its in-memory backend back over your edit before the seed patch runs. Change the backend from Dolphin's own Graphics settings instead, which is what persistence is built around.
+
+### Graphics environment
+
+`sudo` resets the environment before launching Dolphin, so the broker forwards graphics variables through explicitly. Anything the operator sets on the container in the vendor namespaces (`NVIDIA_*`, `VK_*`, `MESA_*`, `LIBGL_*`, `GALLIUM_*`, `RADV_*`, `AMD_*`, `DRI_*`, `LIBVA_*`, `VDPAU_*`, `__GLX_*`, `__NV_*`, `__EGL_*`, `__VK_*`), plus `XDG_DATA_DIRS` and the base image's `DRINODE`, reaches Dolphin. Empty values are dropped rather than forwarded as blanks.
+
+On an NVIDIA host the broker also pins `__GLX_VENDOR_LIBRARY_NAME=nvidia` (and the NVIDIA EGL ICD when its file is present) so GL vendor selection does not depend on udev. The gamepad interposer's fake libudev hides the NVIDIA device from GLVND's udev lookup, which otherwise drops the renderer to Mesa's `llvmpipe`; Mesa-native drivers (AMD/Intel) have a direct render-node fallback and are left alone. A value the operator set themselves always wins.
 
 ## Controllers
 
@@ -190,7 +201,7 @@ Main Stick/Calibration = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
 C-Stick/Calibration    = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
 ```
 
-Mapping and calibration live in `/config` and survive game switches. One catch: Dolphin does not save controller settings on exit, so you have to click **Close** (not just OK) in its controller dialog for changes to reach disk.
+Mapping and calibration live in `/config` and survive game switches. Because the broker quits Dolphin cleanly on teardown, changes you make in its controller dialog are flushed to disk on exit, the same way graphics settings now persist.
 
 ## Troubleshooting
 
