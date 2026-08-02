@@ -86,7 +86,7 @@ The ROM volume has to be mounted at the same path in both containers. If RomM se
 | `SSTATE_WAIT` | `10.0` | Seconds to wait for a state write to land before killing Dolphin. Falls back to a flat 3s sleep if `StateSaves` doesn't exist yet. |
 | `STATE_GET_WAIT` | `30.0` | How long `GET /state-file` waits for an in-flight save before giving up. |
 | `SCREENSHOT_WAIT` | `5.0` | How long to wait for the screenshot hotkey to produce a PNG before shipping the state without a thumbnail. |
-| `DISPLAY_WAIT` | `30.0` | How long to wait for the X socket at startup before starting anyway. |
+| `DISPLAY_WAIT` | `30.0` | How long to wait at startup for the X server to accept connections before starting anyway. |
 | `SSTATE_DIR` | *(probed)* | Savestate directory. Normally found under Dolphin's data dir; override if your build puts it somewhere unusual. |
 | `SAVE_DATA_ROOT` | *(probed)* | Dolphin's data dir. Both the XDG (`/config/.local/share/dolphin-emu`) and non-XDG (`/config/.config/dolphin-emu`) layouts are probed, since it varies by build. |
 | `GCI_CARD_DIR` | *(derived)* | Slot-A GCI folder card path. Defaults to `romm/Card A` under the data dir. |

@@ -303,11 +303,31 @@ class LaunchSerialisation(unittest.TestCase):
 class DisplayWait(unittest.TestCase):
     """The broker used to sleep a flat 5 s and hope the desktop was up."""
 
-    def test_returns_as_soon_as_the_x_socket_exists(self):
-        with unittest.mock.patch.object(Path, "exists", lambda self: True):
+    def test_returns_once_the_display_answers(self):
+        with unittest.mock.patch.object(Path, "exists", lambda self: True), \
+             unittest.mock.patch.object(broker, "_display_accepts_connections", lambda: True):
             started = time.monotonic()
             self.assertTrue(broker._wait_for_display(timeout=5))
         self.assertLess(time.monotonic() - started, 1)
+
+    def test_a_socket_that_refuses_connections_is_not_a_display(self):
+        # Xwayland creates the socket before it serves. Treating the file as
+        # proof of a display launched Dolphin into "could not connect to
+        # display :0" five times, which is the whole relaunch budget, and the
+        # broker abandoned a container that was only slow to boot.
+        with unittest.mock.patch.object(Path, "exists", lambda self: True), \
+             unittest.mock.patch.object(broker, "_display_accepts_connections", lambda: False):
+            self.assertFalse(broker._wait_for_display(timeout=0.3))
+
+    def test_the_display_is_not_probed_before_its_socket_exists(self):
+        # The probe spawns a process; polling it every 250 ms from container
+        # start would be a subprocess per tick for as long as X takes to appear.
+        probes = []
+        with unittest.mock.patch.object(Path, "exists", lambda self: False), \
+             unittest.mock.patch.object(
+                 broker, "_display_accepts_connections", lambda: probes.append(1)):
+            broker._wait_for_display(timeout=0.3)
+        self.assertEqual(probes, [])
 
     def test_gives_up_and_starts_anyway(self):
         # Starting without a display is better than never answering /health.

@@ -645,21 +645,50 @@ def _wait_dolphin_gone(timeout: float = 5.0) -> None:
 DISPLAY_WAIT = float(os.environ.get("DISPLAY_WAIT", "30.0"))
 
 
+def _display_accepts_connections() -> bool:
+    """True when the X server answers a request, not merely when it is listening.
+
+    Xwayland creates /tmp/.X11-unix/X0 before it is ready to serve, so the
+    socket file appears while connections are still refused. Asking it for the
+    display geometry is the cheapest request that proves a client can complete a
+    connection, and it runs as abc so it exercises the same access the Dolphin
+    process will have.
+    """
+    try:
+        return subprocess.run(
+            ["sudo", "-u", "abc", "env"]
+            + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
+            + ["xdotool", "getdisplaygeometry"],
+            capture_output=True, timeout=5,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _wait_for_display(timeout: float = DISPLAY_WAIT) -> bool:
-    """Block until the X server's socket exists, or the timeout expires.
+    """Block until the X server answers, or the timeout expires.
 
     Replaces a flat 5 s sleep: on a cold container the desktop is often not up
     yet at 5 s (so the first Dolphin launch failed silently), and on a warm one
     the sleep was 5 s of dead time before the broker would answer /health.
+
+    The socket file alone was the test until 2026-08-02, and it is not one.
+    Xwayland publishes the socket early, so on a slow cold start the broker
+    called the display up, launched Dolphin into it, and Qt's xcb plugin failed
+    with "could not connect to display :0". Dolphin dies without a window, the
+    monitor counts a crash, and five of those exhaust the relaunch budget: the
+    broker gives up and the container sits with no emulator, having only been
+    slow to boot. The socket check is kept as the gate on the probe, which
+    spawns a process and should not run on every tick before X exists.
     """
     sock = Path(f"/tmp/.X11-unix/X{ENV['DISPLAY'].lstrip(':').split('.')[0]}")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if sock.exists():
+        if sock.exists() and _display_accepts_connections():
             log.info("Display %s is up", ENV["DISPLAY"])
             return True
         time.sleep(0.25)
-    log.warning("Display %s did not appear within %.0fs, starting anyway",
+    log.warning("Display %s did not accept connections within %.0fs, starting anyway",
                 ENV["DISPLAY"], timeout)
     return False
 
