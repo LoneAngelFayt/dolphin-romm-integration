@@ -2,6 +2,8 @@
 
 A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customization) that lets [RomM](https://github.com/rommapp/romm) drive [Dolphin](https://dolphin-emu.org/). Pick a GameCube or Wii game in the RomM web UI, and it boots in the Dolphin container and streams back to your browser.
 
+Dolphin emulates GameCube and Wii only. It does not play Wii U games: the Wii U is a separate console that Dolphin has never supported, so despite the similar name those titles will not run here.
+
 ## What the broker actually is
 
 The mod drops a single Python file into the [linuxserver/dolphin](https://docs.linuxserver.io/images/docker-dolphin/) container and runs it as an s6 service (`svc-broker`). It is a small HTTP server, stdlib only, on port 8000. RomM talks to it; it talks to Dolphin.
