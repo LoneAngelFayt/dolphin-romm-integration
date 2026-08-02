@@ -176,6 +176,8 @@ class RelaunchCounter(unittest.TestCase):
         seen = []
 
         class FakeProc:
+            returncode = 0
+
             def wait(self):
                 return 0
 

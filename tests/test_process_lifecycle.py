@@ -13,14 +13,15 @@ from support import broker, reset_session
 
 
 class FakeProc:
-    def __init__(self, pid=4242):
+    def __init__(self, pid=4242, returncode=0):
         self.pid = pid
+        self.returncode = returncode
 
     def wait(self):
-        return 0
+        return self.returncode
 
     def poll(self):
-        return 0
+        return self.returncode
 
 
 class CrashRelaunch(unittest.TestCase):
@@ -112,6 +113,65 @@ class CrashRelaunch(unittest.TestCase):
             broker._session["process"] = FakeProc(pid=9999)
         self.monitor(0.1)
         self.assertEqual(self.relaunches, 0)
+
+
+class ExitDescription(unittest.TestCase):
+    """How Dolphin died is the first question every launch bug asks.
+
+    "exited after 0.6s" alone cannot tell a Dolphin that chose to stop from one
+    the GPU driver took out, and those lead to opposite investigations.
+    """
+
+    def test_a_clean_exit_reports_its_code(self):
+        self.assertEqual(broker._describe_exit(0), "exit code 0")
+
+    def test_a_failure_exit_reports_its_code(self):
+        self.assertEqual(broker._describe_exit(1), "exit code 1")
+
+    def test_a_signal_death_is_named(self):
+        # Negative codes are signals, and the name is the whole point: SIGSEGV
+        # means the renderer, SIGTERM means we killed it ourselves.
+        self.assertEqual(broker._describe_exit(-11), "killed by SIGSEGV")
+
+    def test_an_unknown_signal_still_reports_its_number(self):
+        self.assertEqual(broker._describe_exit(-99), "killed by signal 99")
+
+    def test_a_live_process_is_not_described_as_dead(self):
+        self.assertEqual(broker._describe_exit(None), "still running")
+
+
+class ExitLogging(unittest.TestCase):
+    """The relaunch lines carry the exit status, not just the duration."""
+
+    def setUp(self):
+        reset_session()
+        self.proc = FakeProc(returncode=-11)
+        with broker._session_lock:
+            broker._session["process"] = self.proc
+            broker._session["is_managed"] = True
+        self.patches = [
+            unittest.mock.patch.object(broker, "_launch_dolphin", lambda *a, **k: None),
+            unittest.mock.patch.object(broker.time, "sleep", lambda _s: None),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+        reset_session()
+
+    def test_the_relaunch_line_names_the_signal(self):
+        with self.assertLogs(broker.log, level="INFO") as captured:
+            broker._monitor_process(self.proc, time.monotonic() - 0.6)
+        self.assertIn("SIGSEGV", "\n".join(captured.output))
+
+    def test_the_giving_up_line_names_the_signal(self):
+        with broker._session_lock:
+            broker._session["relaunch_failures"] = broker.RELAUNCH_MAX_FAILURES
+        with self.assertLogs(broker.log, level="ERROR") as captured:
+            broker._monitor_process(self.proc, time.monotonic() - 0.6)
+        self.assertIn("SIGSEGV", "\n".join(captured.output))
 
 
 class KillProc:

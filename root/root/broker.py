@@ -708,10 +708,31 @@ def _spawn_dolphin(rom_path, state_path=None):
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
 
 
+def _describe_exit(code) -> str:
+    """Readable form of a Popen return code.
+
+    The duration alone cannot separate the two failures that look identical in
+    the log: a Dolphin that decided to stop (a nonzero exit code, so read
+    DOLPHIN_LOG_PATH for the reason it printed) from one the kernel took out
+    mid-frame (a signal, typically SIGSEGV in the GL driver, which usually
+    prints nothing at all). Naming the signal is what makes an empty capture
+    file evidence rather than a dead end.
+    """
+    if code is None:
+        return "still running"
+    if code < 0:
+        try:
+            return f"killed by {signal.Signals(-code).name}"
+        except ValueError:
+            return f"killed by signal {-code}"
+    return f"exit code {code}"
+
+
 def _monitor_process(proc, start_time):
     """On unexpected exit, relaunch the dashboard if the session is still managed."""
     proc.wait()
     duration = time.monotonic() - start_time
+    exit_desc = _describe_exit(proc.returncode)
 
     # A dashboard that dies immediately dies again on relaunch, so back off and
     # eventually stop: an uncapped loop respawned a broken Dolphin forever and
@@ -735,15 +756,16 @@ def _monitor_process(proc, start_time):
 
     if failures > RELAUNCH_MAX_FAILURES:
         log.error(
-            "Dolphin exited after %.1fs on %d consecutive relaunches, giving up",
-            duration, RELAUNCH_MAX_FAILURES,
+            "Dolphin exited after %.1fs (%s) on %d consecutive relaunches, giving up",
+            duration, exit_desc, RELAUNCH_MAX_FAILURES,
         )
         with _session_lock:
             _session["is_managed"] = False
             _session["relaunch_failures"] = 0
         return
 
-    log.info("Dolphin exited after %.1fs, relaunching dashboard in %ds", duration, wait_time)
+    log.info("Dolphin exited after %.1fs (%s), relaunching dashboard in %ds",
+             duration, exit_desc, wait_time)
     time.sleep(wait_time)
 
     with _session_lock:
