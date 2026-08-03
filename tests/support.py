@@ -48,6 +48,10 @@ def reset_session():
             save_in_progress=False,
             save_baseline=None,
             relaunch_failures=0,
+            stream_token=None,
+            stream_expires=0.0,
+            stream_prev_token=None,
+            stream_prev_expires=0.0,
         )
 
 

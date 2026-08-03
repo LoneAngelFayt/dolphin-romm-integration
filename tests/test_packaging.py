@@ -45,23 +45,48 @@ class DockerMod(unittest.TestCase):
 
 
 class S6Services(unittest.TestCase):
-    def test_the_broker_is_a_longrun_and_the_config_step_is_a_oneshot(self):
+    def test_the_broker_is_a_longrun_and_the_init_steps_are_oneshots(self):
         self.assertEqual((S6 / "svc-broker/type").read_text().strip(), "longrun")
+        for unit in ("init-dolphin-config", "init-dolphin-deps"):
+            with self.subTest(unit=unit):
+                self.assertEqual((S6 / unit / "type").read_text().strip(), "oneshot")
+
+    def test_every_service_is_enabled_in_the_user_bundle(self):
+        enabled = {p.name for p in (S6 / "user/contents.d").iterdir()}
         self.assertEqual(
-            (S6 / "init-dolphin-config/type").read_text().strip(), "oneshot"
+            enabled, {"svc-broker", "init-dolphin-config", "init-dolphin-deps"}
         )
 
-    def test_both_services_are_enabled_in_the_user_bundle(self):
-        enabled = {p.name for p in (S6 / "user/contents.d").iterdir()}
-        self.assertEqual(enabled, {"svc-broker", "init-dolphin-config"})
-
-    def test_the_broker_waits_for_the_config_step(self):
+    def test_the_broker_waits_for_both_init_steps(self):
         deps = {p.name for p in (S6 / "svc-broker/dependencies.d").iterdir()}
         self.assertIn("init-dolphin-config", deps)
+        self.assertIn("init-dolphin-deps", deps)
 
-    def test_the_oneshot_up_file_points_at_the_script_that_exists(self):
-        up = (S6 / "init-dolphin-config/up").read_text().strip()
-        self.assertTrue(Path(REPO_ROOT / "root" / up.lstrip("/")).is_file(), up)
+    def test_the_service_stack_waits_for_the_config_step(self):
+        """Without this edge every patch in init-dolphin-config is dead.
+
+        nginx, xorg and selkies read their config once at start. s6 otherwise
+        runs them in parallel with the oneshot, they win by seconds, and the
+        stream gate is simply absent from the nginx that is actually serving.
+        """
+        self.assertTrue(
+            (S6 / "init-services/dependencies.d/init-dolphin-config").exists()
+        )
+
+    def test_the_slow_work_is_not_in_the_step_the_stack_waits_on(self):
+        """apt-get belongs in init-dolphin-deps, which only the broker waits for.
+
+        In init-dolphin-config it would park the whole desktop behind a package
+        download on every cold start.
+        """
+        self.assertNotIn("apt-get", INIT_SRC)
+        self.assertIn("apt-get", (S6 / "init-dolphin-deps/init.sh").read_text())
+
+    def test_each_oneshot_up_file_points_at_the_script_that_exists(self):
+        for unit in ("init-dolphin-config", "init-dolphin-deps"):
+            with self.subTest(unit=unit):
+                up = (S6 / unit / "up").read_text().strip()
+                self.assertTrue(Path(REPO_ROOT / "root" / up.lstrip("/")).is_file(), up)
 
     def test_the_run_script_execs_the_broker_that_ships(self):
         run = (S6 / "svc-broker/run").read_text()
@@ -70,6 +95,55 @@ class S6Services(unittest.TestCase):
 
     def test_the_broker_runs_unbuffered_so_logs_reach_s6(self):
         self.assertIn("python3 -u", (S6 / "svc-broker/run").read_text())
+
+
+class NginxStreamGate(unittest.TestCase):
+    """The gate is split across init.sh and broker.py and must agree.
+
+    nginx names the internal subrequest and the broker answers it; a rename on
+    either side leaves a gate that authorises nothing, and nginx will not
+    complain because auth_request off is a perfectly valid config.
+    """
+
+    def test_the_gate_calls_the_route_the_broker_serves(self):
+        self.assertIn("/verify", INIT_SRC)
+        self.assertIn('"/verify"', BROKER_SRC)
+
+    def test_the_gate_targets_the_port_the_broker_listens_on(self):
+        self.assertIn('bport="${BROKER_PORT:-8000}"', INIT_SRC)
+        self.assertIn('BROKER_PORT", "8000"', BROKER_SRC)
+
+    def test_the_set_cookie_header_is_carried_back_out(self):
+        # auth_request drops the subrequest's response headers unless they are
+        # captured; without this the stream_sid cookie never reaches the browser
+        # and every asset after the first re-presents the query token.
+        self.assertIn(
+            "auth_request_set $stream_set_cookie $upstream_http_set_cookie", INIT_SRC
+        )
+        self.assertIn("add_header Set-Cookie $stream_set_cookie", INIT_SRC)
+
+    def test_the_error_page_is_exempt_from_the_gate(self):
+        # /50x.html is the error_page target. Gated, a broker outage makes each
+        # request bounce between the 500 and its own gated error page until
+        # nginx trips its internal-redirect limit.
+        self.assertIn("/50x\\.html", INIT_SRC)
+        self.assertIn('print "    auth_request off;"', INIT_SRC)
+
+    def test_the_gate_is_anchored_on_every_server_block(self):
+        # The base image ships two identical vhosts (3000 plain, 3001 TLS).
+        # Anchoring on 'server {' rather than a port gates both, and the count
+        # check in init.sh warns when fewer than two matched.
+        self.assertIn("server[[:space:]]*\\{", INIT_SRC)
+        self.assertIn("only $gated vhost gated", INIT_SRC)
+
+    def test_verify_is_reachable_without_the_shared_secret(self):
+        # nginx cannot forward BROKER_SECRET on a subrequest, so /verify has to
+        # be routed before _check_secret runs. The stream token is its credential.
+        get_body = re.search(r"def do_GET\(self\).*?(?=\n    def )", BROKER_SRC, re.S)
+        self.assertIsNotNone(get_body, "do_GET not found, did it get renamed?")
+        verify = get_body.group(0).index("/verify")
+        secret = get_body.group(0).index("_check_secret")
+        self.assertLess(verify, secret, "/verify is routed after the secret check")
 
 
 class Sudoers(unittest.TestCase):

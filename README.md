@@ -79,8 +79,10 @@ The ROM volume has to be mounted at the same path in both containers. If RomM se
 
 | Variable | Default | What it does |
 |---|---|---|
-| `BROKER_SECRET` | *(empty)* | Shared secret, sent as `X-Broker-Secret`. Empty means every request is accepted. |
-| `BROKER_PORT` | `8000` | Port the broker listens on. |
+| `BROKER_SECRET` | *(empty)* | Shared secret, sent as `X-Broker-Secret`. Empty means every request is accepted, which is a debugging mode and a known hole. See [Security](#security). |
+| `BROKER_PORT` | `8000` | Port the broker listens on. Also the port the injected nginx gate sends its `auth_request` to. |
+| `STREAM_TOKEN_TTL` | `43200.0` | Seconds of idle before a stream token stops admitting. Refreshed on every request the gate lets through, so it only closes an abandoned session. |
+| `STREAM_TOKEN_GRACE` | `120.0` | Seconds a superseded stream token keeps working after a relaunch mints a new one, so an open tab survives the handoff. |
 | `ROM_ROOT` | `/romm/library` | Where ROMs are mounted. A `rom_path` outside this is rejected. |
 | `SAVE_SLOT` | `8` | The one slot every state save and load uses (1-8). |
 | `SSTATE_WAIT` | `10.0` | Seconds to wait for a state write to land before killing Dolphin. Falls back to a flat 3s sleep if `StateSaves` doesn't exist yet. |
@@ -97,7 +99,7 @@ The ROM volume has to be mounted at the same path in both containers. If RomM se
 
 ## API
 
-Send `X-Broker-Secret` on every request when `BROKER_SECRET` is set. File bodies are capped at 256 MB.
+Send `X-Broker-Secret` on every request when `BROKER_SECRET` is set. File bodies are capped at 256 MB. `GET /health` and `GET /verify` are the two exceptions, for the reasons in [Security](#security).
 
 | Endpoint | Does | Notable failures |
 |---|---|---|
@@ -118,6 +120,7 @@ Send `X-Broker-Secret` on every request when `BROKER_SECRET` is set. File bodies
 | `POST /volume` | `{"level": 80}` | `500` pactl failed |
 | `POST /mute` | `{"mute": true}`, or `{}` to toggle | `500` pactl failed |
 | `POST /cleanup` | Restart selkies to flush stale gamepad connections. Use it if controllers go dead | none |
+| `GET /verify` | The nginx `auth_request` target for the stream gate. Not for clients, see [Security](#security) | `403` no valid stream token |
 
 Slots are 1-8. `0` or an omitted slot resolves to `SAVE_SLOT` everywhere.
 
@@ -130,11 +133,14 @@ Slots are 1-8. `0` or an omitted slot resolves to `SAVE_SLOT` everywhere.
   "rom_name": "game",
   "started_at": "2026-01-01T00:00:00Z",
   "save_slot": 8,
-  "autosave_slot": 8
+  "autosave_slot": 8,
+  "stream_token": "GZ1s..."
 }
 ```
 
 `active` here means a game is genuinely running: the process is alive *and* a ROM is loaded, so an idle container on the dashboard reports `active: false`. (The PCSX2 broker differs, so don't carry the assumption across.) `rom_path`, `rom_name` and `started_at` are `null` whenever `active` is false. `save_slot` and `autosave_slot` are two names for the same number, kept for older RomM clients.
+
+`stream_token` is the credential for the stream itself, republished here so a client that lost its iframe can re-attach without a relaunch. It is `null` whenever `active` is false, and whenever the token has aged out. See [Security](#security).
 
 ### Launching
 
@@ -147,6 +153,8 @@ Slots are 1-8. `0` or an omitted slot resolves to `SAVE_SLOT` everywhere.
 A folder with nothing bootable inside returns `422` with an `extensions` list, which is a different message from the `422` for a path that doesn't exist. Every broker in this family behaves the same way here.
 
 `load_slot` resumes from a state, and it is not the same mechanism as `/load-state`. The broker resolves the slot to its state file and passes it to Dolphin as `--save_state`, so the state is applied during boot and the game is never seen running un-resumed. Push the state file with `PUT /state-file` *before* launching, or you get a `404`.
+
+The response carries a `stream_token` alongside the resolved path. Append it to the stream URL as `?stream_token=...` or nginx will refuse the iframe, see [Security](#security).
 
 ### Save slots
 
@@ -207,6 +215,22 @@ C-Stick/Calibration    = 100.00 100.00 100.00 100.00 100.00 100.00 100.00 100.00
 
 Mapping and calibration live in `/config` and survive game switches. Because the broker quits Dolphin cleanly on teardown, changes you make in its controller dialog are flushed to disk on exit, the same way graphics settings now persist.
 
+## Security
+
+Two credentials, guarding two different things.
+
+**`BROKER_SECRET` guards the API on port 8000.** Sent as `X-Broker-Secret`, compared in constant time. `GET /health` and `GET /verify` are deliberately exempt: `/health` so it works as a container healthcheck, `/verify` because nginx's `auth_request` cannot forward the secret and the stream token is itself the credential there.
+
+**The stream token guards the desktop on 3000/3001.** It is minted per session by `POST /launch`, 256 bits from `secrets.token_urlsafe`, and enforced by an nginx `auth_request` that the mod injects into *every* `server` block in the site config. That matters: the base image ships two identical vhosts, plain HTTP on 3000 and TLS on 3001, both proxying the same selkies stream and both serving `/config/Desktop` at `/files`. Gating only the TLS one left a complete bypass a port number away. The `stream_sid` cookie is `Secure`, so 3000 is usable only behind a TLS-terminating proxy: direct plain-HTTP browsing to it now fails closed.
+
+The token is idle-expiring rather than fixed-lifetime, so a long session is never cut off mid-game, and `DELETE /launch` and save-and-exit revoke it immediately. A relaunch mints a new one and keeps the old alive for a couple of minutes, so an open tab survives the handoff.
+
+**Leaving `BROKER_SECRET` unset is a known hole, not a supported mode.** The broker runs as root inside the container, so the open API means root-privileged reads and writes under `/config`, plus arbitrary launches within `ROM_ROOT`. Worse, the two credentials stop being independent: `POST /launch` *returns* a stream token, so an unauthenticated broker hands out the credential that opens the desktop. Use it for local debugging on a trusted host and nothing else.
+
+**Mount the ROM library read-only.** The Quick start does (`:ro`), and it is not decoration. The stream is an interactive desktop with a file manager on it, so anything the container can write to, a stream session can rewrite or delete. Read-only turns a compromised session into a nuisance rather than a lost library.
+
+Port 8000 is plain HTTP, so the secret crosses the network in the clear. Keep the broker on an internal network, or put TLS in front of it.
+
 ## Troubleshooting
 
 ### Nothing reaches Dolphin
@@ -221,6 +245,8 @@ Neither broker hotkeys nor browser gamepad input works. **Treat simultaneous fai
 `BackgroundInput` goes under `[Input]`, **not** `[General]`. In the wrong section it is silently ignored and the gate stays shut. Check with `grep -A1 '\[Input\]' Dolphin.ini`, and restart the emulator to reload it.
 
 ### Everything else
+
+**"An error occurred, restarting stream", over and over.** The stream client says this whenever its WebSocket drops, so the useful signal is on the broker side: `docker logs <container> | grep "/verify"`. A `403` there names the reason (`no stream token in the request`, `stream token expired`, `stream token superseded by a newer launch`), and the token is redacted so the line is safe to share. No `/verify` lines *at all* means the gate is not running: the mod's init never patched nginx. Check `docker logs <container> | grep broker-mod` for the "Applied nginx stream gate to N vhost(s)" line, which should say 2.
 
 **Game launches, screen stays black.** Give Dolphin a few seconds. If it persists, confirm `WAYLAND_DISPLAY` is not set in the container environment and that no other mod is injecting a fake libudev. Check `DOLPHIN_LOG_PATH` for renderer errors.
 

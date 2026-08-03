@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket as _socket
@@ -17,6 +18,7 @@ import tempfile
 import time
 import zipfile
 from collections.abc import Iterable
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from threading import Thread, Lock
@@ -26,6 +28,11 @@ from urllib.parse import parse_qs, urlparse
 
 PORT       = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET     = os.environ.get("BROKER_SECRET", "")
+# The secret is compared as bytes, never as str: hmac.compare_digest refuses a
+# str with non-ASCII characters, so a UTF-8 BROKER_SECRET would raise inside
+# every _check_secret and answer 500 to every request. Encoding once here keeps
+# the comparison total for any secret an operator can set.
+_SECRET_BYTES = SECRET.encode("utf-8")
 ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 MAX_SLOT      = 8                                       # Dolphin maps F1-F8 / Shift+F1-F8 to slots 1-8
 # Every state write (manual save, save-and-exit, auto-save on navigate-away)
@@ -40,6 +47,19 @@ if not (1 <= SAVE_SLOT <= MAX_SLOT):
 # Returns as soon as the file size is stable, so raising this only affects the
 # failure path. Falls back to a fixed 3 s sleep if the StateSaves dir is absent.
 SSTATE_WAIT   = float(os.environ.get("SSTATE_WAIT", "10.0"))
+
+# Stream token lifetime. The TTL is idle time, not absolute: every admitted
+# request slides it forward, so it only fires on a session nobody is watching.
+# Without it a token minted by /launch stays valid until an explicit release,
+# and a container that loses its RomM side (crash, network partition, a user
+# who just closes the tab) leaves the gate open indefinitely.
+STREAM_TOKEN_TTL   = float(os.environ.get("STREAM_TOKEN_TTL",   "43200.0"))
+# How long the superseded token keeps working after a re-issue. Relaunching
+# into an already-open tab means the browser is still replaying the old
+# stream_sid cookie while RomM navigates the iframe to the new URL; without
+# this window every one of those in-flight requests 403s and the stream client
+# reports a dropped connection and retries in a loop.
+STREAM_TOKEN_GRACE = float(os.environ.get("STREAM_TOKEN_GRACE", "120.0"))
 
 # Dashboard crash-relaunch policy. A Dolphin that survives longer than the
 # healthy threshold clears the failure count; anything shorter is treated as a
@@ -248,7 +268,142 @@ _session: dict = {
     "save_baseline": None,
     # Consecutive short-lived dashboard exits; see _monitor_process.
     "relaunch_failures": 0,
+    # Random per-session token gating the selkies stream. Minted on /launch,
+    # swapped for a cookie by the browser, cleared when the session is
+    # released. The expiry is a monotonic deadline refreshed on every admitted
+    # request; the prev_* pair holds the token a re-issue replaced, valid for a
+    # short grace window so an already-open tab is not cut off mid-relaunch.
+    "stream_token":         None,
+    "stream_expires":       0.0,
+    "stream_prev_token":    None,
+    "stream_prev_expires":  0.0,
 }
+
+# ── Stream gate ───────────────────────────────────────────────────────────────
+# nginx auth_request sends every request for the desktop to /verify, which
+# checks this token. It is a second credential, independent of BROKER_SECRET:
+# nginx cannot forward the shared secret, and the browser must be able to carry
+# this one, so /verify is the single route exempt from the secret check.
+
+
+def _issue_stream_token() -> str:
+    """Mint a fresh stream token and bind it to the current session.
+
+    The token being replaced is demoted rather than dropped: it stays usable
+    for STREAM_TOKEN_GRACE seconds so requests already in flight from an open
+    tab still land. See STREAM_TOKEN_GRACE for why that matters.
+    """
+    token = secrets.token_urlsafe(32)
+    now = time.monotonic()
+    with _session_lock:
+        previous = _session["stream_token"]
+        if previous:
+            _session["stream_prev_token"] = previous
+            _session["stream_prev_expires"] = now + STREAM_TOKEN_GRACE
+        _session["stream_token"] = token
+        _session["stream_expires"] = now + STREAM_TOKEN_TTL
+    return token
+
+
+def _check_stream_token(token: str) -> str | None:
+    """Judge token against the live session token, then the superseded one.
+
+    Returns None when the token is good, otherwise a short reason for the log.
+    A hit on the live token slides its expiry forward: the TTL exists to close
+    an abandoned session, not to interrupt someone who is still playing.
+    """
+    if not token:
+        return "no stream token in the request"
+    now = time.monotonic()
+    with _session_lock:
+        current = _session["stream_token"]
+        if not current:
+            return "no stream session is open"
+        if hmac.compare_digest(token, current):
+            if now >= _session["stream_expires"]:
+                return "stream token expired after %.0fs idle" % STREAM_TOKEN_TTL
+            _session["stream_expires"] = now + STREAM_TOKEN_TTL
+            return None
+        previous = _session["stream_prev_token"]
+        if previous and hmac.compare_digest(token, previous):
+            if now < _session["stream_prev_expires"]:
+                return None
+            _session["stream_prev_token"] = None
+            _session["stream_prev_expires"] = 0.0
+            return "stream token superseded by a newer launch"
+    return "stream token does not match the open session"
+
+
+def _clear_stream_token() -> None:
+    """Drop the stream token so the gate rejects everything until next launch."""
+    with _session_lock:
+        _session["stream_token"] = None
+        _session["stream_expires"] = 0.0
+        _session["stream_prev_token"] = None
+        _session["stream_prev_expires"] = 0.0
+
+
+def _live_stream_token() -> str | None:
+    """The session token if it is still inside its TTL, else None.
+
+    /status hands this to RomM so a reconnecting client can re-attach without
+    a relaunch. An expired token would only send it into the 403 loop the TTL
+    is there to end, so it is reported as absent.
+    """
+    with _session_lock:
+        if _session["stream_token"] and time.monotonic() < _session["stream_expires"]:
+            return _session["stream_token"]
+    return None
+
+
+def _extract_stream_token(query: str, cookie_header: str | None) -> str | None:
+    """Read the stream token: query stream_token wins, else the stream_sid cookie."""
+    qs = parse_qs(query)
+    if qs.get("stream_token"):
+        return qs["stream_token"][0]
+    if cookie_header:
+        jar = SimpleCookie()
+        jar.load(cookie_header)
+        if "stream_sid" in jar:
+            return jar["stream_sid"].value
+    return None
+
+
+def _stream_cookie_value(token: str) -> str:
+    """Set-Cookie value for the stream session. SameSite=None, Secure, and
+    Partitioned are required: the iframe is cross-site to RomM, so the cookie
+    is third-party and browsers partition or drop it without these attributes."""
+    return (
+        f"stream_sid={token}; HttpOnly; Secure; "
+        "SameSite=None; Partitioned; Path=/"
+    )
+
+
+def _verify_stream_decision(
+    original_uri: str, cookie_header: str | None
+) -> tuple[int, str | None, str | None]:
+    """Decide an nginx auth_request subrequest for the stream gate.
+
+    Returns (status, set_cookie, reason). 200 admits the request, 403 rejects
+    it and carries the reason so the refusal is legible in the container log.
+    When the token arrives in the query (the first iframe load), the caller
+    gets a Set-Cookie so later requests carry stream_sid and the token drops
+    out of the URL. A cookie-authed request that is already good gets no
+    Set-Cookie back, so nginx does not rewrite it.
+    """
+    query = urlparse(original_uri).query
+    token = _extract_stream_token(query, cookie_header)
+    reason = _check_stream_token(token or "")
+    if reason:
+        return 403, None, reason
+    if "stream_token" in parse_qs(query):
+        # Re-cookie on the query bootstrap, and also when the query token is
+        # the current one but the cookie still holds the superseded token:
+        # the browser must be moved onto the new value before the grace
+        # window closes, or the tab drops out the moment it does.
+        return 200, _stream_cookie_value(token), None
+    return 200, None, None
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1817,18 +1972,71 @@ def _replace_memory_card_locked(source: bytes | Path) -> tuple[int] | str:
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
+def _redact_uri(uri: str) -> str:
+    """Strip the stream token out of a URI before it reaches the log.
+
+    The stream gate admits a viewer on `?stream_token=...`, so logging a raw
+    request line would put a live credential in stdout, where it is exactly the
+    text an operator pastes into a bug report.
+    """
+    return re.sub(r"(stream_token=)[^&]*", r"\1REDACTED", uri)
+
+
+def _header_token(value: str, fallback: str) -> str:
+    """Reduce `value` to something safe to send as an HTTP header value.
+
+    Header values are latin-1 and http.server writes them through without
+    validating, so a CR or LF reaching send_header splits the response. Both
+    callers pass names taken off the filesystem, where those bytes are legal
+    in a filename, so the filter belongs here rather than at each call site.
+    """
+    safe = "".join(c for c in value if c.isascii() and c.isprintable()).strip()
+    return safe or fallback
+
+
 class BrokerHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
-        log.debug("HTTP %s", fmt % args)
+        log.debug("HTTP %s", _redact_uri(fmt % args))
 
     def _check_secret(self) -> bool:
         if not SECRET:
             return True
+        # latin-1 is how http.server decoded the header, so encoding it back
+        # recovers exactly the bytes that arrived on the wire, which is what
+        # _SECRET_BYTES is comparable against.
         return hmac.compare_digest(
-            self.headers.get("X-Broker-Secret", ""),
-            SECRET,
+            self.headers.get("X-Broker-Secret", "").encode("latin-1", "replace"),
+            _SECRET_BYTES,
         )
+
+    def _verify_stream(self) -> None:
+        """Answer the nginx auth_request subrequest that gates the desktop.
+
+        nginx forwards the real request URI (carrying the stream_token query on
+        the first iframe load) via X-Original-URI and the browser Cookie
+        header; 200 admits the request, 403 rejects it, and a Set-Cookie on the
+        query bootstrap moves the browser onto stream_sid.
+        """
+        original_uri = self.headers.get("X-Original-URI", "")
+        status, set_cookie, reason = _verify_stream_decision(
+            original_uri, self.headers.get("Cookie")
+        )
+        if status != 200:
+            # The access line is DEBUG and the default level is INFO, so
+            # without this a gated-out viewer is invisible to an operator
+            # reading container logs: the stream just never loads.
+            log.warning(
+                "stream gate: 403 for %s from %s: %s",
+                _redact_uri(original_uri) or "(no X-Original-URI)",
+                self.client_address[0],
+                reason,
+            )
+        headers = {"Set-Cookie": set_cookie} if set_cookie else None
+        body = {"ok": status == 200}
+        if status != 200:
+            body["error"] = reason or "stream request rejected"
+        self._send_json(status, body, headers)
 
     def _send_json(self, code: int, body: dict, headers: dict | None = None) -> None:
         payload = json.dumps(body).encode()
@@ -1946,7 +2154,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(size))
-        self.send_header("X-State-Filename", state_path.name)
+        self.send_header(
+            "X-State-Filename", _header_token(state_path.name, "state.s01")
+        )
         self.end_headers()
         sent = 0
         try:
@@ -2029,9 +2239,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             )
             return
         # Header values must be latin-1; ROM stems can be anything.
-        safe_name = "".join(
-            c for c in (rom_name or "dolphin") if c.isascii() and c.isprintable()
-        ).strip() or "dolphin"
+        safe_name = _header_token(rom_name or "dolphin", "dolphin")
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Length", str(len(archive)))
@@ -2127,6 +2335,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not (1 <= int(ext[1:]) <= MAX_SLOT):
             self._send_json(400, {"error": f"filename slot must be 01-{MAX_SLOT:02d}"})
             return
+        # The stem is otherwise unconstrained, and CR and LF are legal in a
+        # Linux filename, so without this a stored name carrying them would
+        # split the response when GET /state-file echoes it back as
+        # X-State-Filename. _header_token sanitises that emit too; this refuses
+        # the name outright rather than silently storing a mangled one.
+        if filename != _header_token(filename, ""):
+            self._send_json(400, {"error": "filename must be printable ASCII"})
+            return
 
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -2173,9 +2389,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
+        elif urlparse(self.path).path == "/verify":
+            self._verify_stream()
         elif not self._check_secret():
-            # /health stays open for container healthchecks; all other GETs
-            # require the shared secret, matching POST/DELETE.
+            # /health and /verify stay open; /health for container
+            # healthchecks, /verify because the stream token is itself the
+            # credential (nginx auth_request cannot forward the broker secret).
+            # All other GETs require the shared secret, matching POST/DELETE.
             self._send_json(403, {"error": "forbidden"})
         elif urlparse(self.path).path == "/state-file":
             self._get_state_file()
@@ -2200,6 +2420,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 "started_at":    snap.get("started_at") if active else None,
                 "autosave_slot": AUTOSAVE_SLOT,
                 "save_slot":     SAVE_SLOT,
+                # Handed back so a client that lost its iframe can re-attach
+                # without a relaunch. Only while a game is running: the gate is
+                # closed the moment the session is released.
+                "stream_token":  _live_stream_token() if active else None,
             })
         else:
             self._send_json(404, {"error": "not found"})
@@ -2247,8 +2471,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if not ok:
                     log.warning("save-and-exit: save key failed (slot %d), killed anyway", slot)
                 self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
+                # Save-and-exit releases the session, so the stream token must
+                # die with it: a discovered host is otherwise still usable.
+                _clear_stream_token()
                 Thread(target=_launch_dolphin, args=(None,), daemon=True).start()
             else:
+                _clear_stream_token()
+
                 def _bg(s):
                     try:
                         ok = _save_and_exit(s)
@@ -2425,6 +2654,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 })
                 return
 
+        stream_token = _issue_stream_token()
         Thread(
             target=_launch_dolphin,
             args=(str(rom_path), str(state_path) if state_path else None),
@@ -2434,6 +2664,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             "status": "launching",
             "rom_path": str(rom_path),
             "load_slot": load_slot,
+            "stream_token": stream_token,
         })
 
     def do_DELETE(self):
@@ -2444,6 +2675,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
 
+        # DELETE /launch releases the session, so the stream token must die
+        # with it: a discovered host is otherwise still usable.
+        _clear_stream_token()
         Thread(target=_launch_dolphin, args=(None,), daemon=True).start()
         log.info("Soft reset: returning to dashboard")
         self._send_json(200, {"status": "resetting"})

@@ -54,6 +54,12 @@ class ApiTestCase(unittest.TestCase):
 
         self.patches = [
             unittest.mock.patch.object(broker, "SECRET", self.SECRET),
+            # _check_secret compares bytes, so the encoded copy has to move
+            # with it. Patching SECRET alone leaves the comparison against the
+            # import-time b"" and every authenticated request 403s.
+            unittest.mock.patch.object(
+                broker, "_SECRET_BYTES", self.SECRET.encode("utf-8")
+            ),
             unittest.mock.patch.object(broker, "ROM_ROOT", self.rom_root.resolve()),
             unittest.mock.patch.object(broker, "_launch_dolphin", self._fake_launch),
             unittest.mock.patch.object(broker, "_xdotool_save_state", lambda slot: True),
@@ -99,12 +105,16 @@ class ApiTestCase(unittest.TestCase):
 
     # ── request helper ────────────────────────────────────────────────────
 
-    def request(self, method, path, body=None, secret=SECRET, raw=None) -> Response:
+    def request(
+        self, method, path, body=None, secret=SECRET, raw=None, headers=None
+    ) -> Response:
         url = f"http://127.0.0.1:{self.port}{path}"
         data = raw if raw is not None else (json.dumps(body).encode() if body else None)
         req = urllib.request.Request(url, data=data, method=method)
         if secret is not None:
             req.add_header("X-Broker-Secret", secret)
+        for name, value in (headers or {}).items():
+            req.add_header(name, value)
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return Response(resp.status, dict(resp.headers), resp.read())
@@ -148,6 +158,35 @@ class Auth(ApiTestCase):
         self.assertEqual(
             self.request("GET", "/status", secret=self.SECRET[:-1]).status, 403
         )
+
+    def test_verify_is_the_one_route_exempt_from_the_secret(self):
+        # nginx cannot forward BROKER_SECRET on an auth_request subrequest, so
+        # /verify has to answer without it. That is not the same as open: the
+        # stream token is its credential, and with none issued it refuses.
+        resp = self.request("GET", "/verify", secret=None)
+        self.assertEqual(resp.status, 403)
+
+    def test_verify_admits_the_current_stream_token_and_cookies_the_browser(self):
+        token = broker._issue_stream_token()
+        resp = self.request(
+            "GET",
+            "/verify",
+            secret=None,
+            headers={"X-Original-URI": f"/?stream_token={token}"},
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertIn(f"stream_sid={token}", resp.headers["Set-Cookie"])
+
+    def test_verify_refuses_a_token_from_a_finished_session(self):
+        token = broker._issue_stream_token()
+        broker._clear_stream_token()
+        resp = self.request(
+            "GET",
+            "/verify",
+            secret=None,
+            headers={"X-Original-URI": f"/?stream_token={token}"},
+        )
+        self.assertEqual(resp.status, 403)
 
     def test_unknown_routes_are_404(self):
         for method in ("GET", "POST", "PUT", "DELETE"):
@@ -261,6 +300,34 @@ class Launch(ApiTestCase):
         self.assertEqual(resp.status, 200)
         self.wait_for_launch()
         self.assertEqual(self.launches[-1], (None, None))
+
+    def test_launch_hands_back_the_stream_token_for_the_iframe_url(self):
+        rom = write(self.rom_root / "game.iso")
+        token = self.request("POST", "/launch", {"rom_path": str(rom)}).json()[
+            "stream_token"
+        ]
+        self.assertTrue(token)
+        self.assertIsNone(broker._check_stream_token(token))
+
+    def test_status_republishes_the_token_so_a_reconnect_needs_no_relaunch(self):
+        rom = write(self.rom_root / "game.iso")
+        self.request("POST", "/launch", {"rom_path": str(rom)})
+        self.start_session()
+        with broker._session_lock:
+            broker._session["process"] = unittest.mock.Mock(poll=lambda: None)
+        body = self.request("GET", "/status").json()
+        self.assertEqual(body["stream_token"], broker._live_stream_token())
+
+    def test_delete_closes_the_stream_gate_behind_it(self):
+        # Returning to the dashboard ends the session, so the token that was
+        # handed out for it must stop admitting anything. Otherwise a tab left
+        # open keeps a live desktop after RomM believes the session is over.
+        rom = write(self.rom_root / "game.iso")
+        token = self.request("POST", "/launch", {"rom_path": str(rom)}).json()[
+            "stream_token"
+        ]
+        self.request("DELETE", "/launch")
+        self.assertIsNotNone(broker._check_stream_token(token))
 
     def wait_for_launch(self, timeout=5.0):
         import time
@@ -486,6 +553,26 @@ class StateFileTransfer(ApiTestCase):
                 "PUT", "/state-file?filename=GALE01.s08", raw=b"far too long"
             )
         self.assertEqual(resp.status, 413)
+
+    def test_put_refuses_a_filename_that_could_split_a_response_header(self):
+        # GET echoes the stored name back in X-State-Filename, and http.server
+        # writes header values through unvalidated. A stored name carrying CRLF
+        # would let the next GET inject headers, or a body, into that response.
+        for name in ("evil%0d%0aX-Injected:%20yes.s08", "Pok%c3%a9mon.s08"):
+            with self.subTest(name=name):
+                resp = self.request("PUT", f"/state-file?filename={name}", raw=b"x")
+                self.assertEqual(resp.status, 400)
+                self.assertEqual(list(self.state_dir.iterdir()), [])
+
+    def test_get_never_emits_a_state_name_it_cannot_put_in_a_header(self):
+        # Belt and braces for the PUT check: a name that arrived by any other
+        # route, a restored backup or a hand-copied file, is filtered on the
+        # way out rather than trusted because PUT would have refused it.
+        write(self.state_dir / "evil\r\nX-Injected: yes.s08", b"statebytes")
+        resp = self.request("GET", "/state-file?slot=8")
+        self.assertEqual(resp.status, 200)
+        self.assertNotIn("x-injected", {k.lower() for k in resp.headers})
+        self.assertNotIn("\n", resp.headers["X-State-Filename"])
 
     def test_round_trips_a_state_through_put_then_get(self):
         self.request("PUT", "/state-file?filename=GALE01.s08", raw=b"round trip")
