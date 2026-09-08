@@ -4,6 +4,46 @@ A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customi
 
 Dolphin emulates GameCube and Wii only. It does not play Wii U games: the Wii U is a separate console that Dolphin has never supported, so despite the similar name those titles will not run here.
 
+## Migrating to webstation (v2)
+
+This per-emulator broker mod is deprecated in favor of a single [docker-webstation](https://github.com/linuxserver/docker-webstation) container running [romm-broker](https://github.com/romm-streaming/romm-broker). It still works today, but it won't get new features, and RomM will eventually drop support for the per-emulator shape entirely.
+
+Why: one container serving every platform RomM streams beats one container per emulator, and one broker implementation beats five slowly-drifting forks of the same code.
+
+Before, one container per platform:
+
+```yaml
+streaming:
+  containers:
+    - platform: ngc
+      host: http://<dolphin-host>:3001
+      label: Dolphin
+      memory_card_sync: true
+    - platform: wii
+      host: http://<dolphin-host>:3001
+      label: Dolphin
+```
+
+After, both platforms under one webstation container:
+
+```yaml
+streaming:
+  containers:
+    - host: http://<webstation-host>:3010
+      protocol: webstation
+      label: Emulation station
+      platforms:
+        ngc:
+          emulator: dolphin
+          label: Dolphin
+          memory_card_sync: true
+        wii:
+          emulator: dolphin
+          label: Dolphin
+```
+
+See RomM's `docs/STREAMING_MIGRATION.md` for the full guide: https://github.com/rommapp/romm/blob/master/docs/STREAMING_MIGRATION.md
+
 ## What the broker actually is
 
 The mod drops a single Python file into the [linuxserver/dolphin](https://docs.linuxserver.io/images/docker-dolphin/) container and runs it as an s6 service (`svc-broker`). It is a small HTTP server, stdlib only, on port 8000. RomM talks to it; it talks to Dolphin.
